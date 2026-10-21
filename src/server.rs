@@ -1,9 +1,10 @@
 use crate::adc_auth::ADCAuthManager;
 use crate::translator::{
-    anthropic_to_gemini_request, extract_candidate_parts, format_sse, gemini_to_anthropic_response,
+    anthropic_to_gemini_request, default_fast_gemini_model, default_gemini_model,
+    extract_candidate_parts, format_sse, gemini_to_anthropic_response,
     gemini_to_openai_chat_response, gemini_to_openai_responses, openai_chat_to_gemini_request,
     openai_responses_to_gemini_request, resolve_gemini_model, AnthropicStreamState,
-    DEFAULT_GEMINI_MODEL, SIGNATURE_STORE,
+    SIGNATURE_STORE,
 };
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -15,6 +16,16 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+pub const DEFAULT_AVAILABLE_MODELS: &[&str] = &[
+    "gemini-4-argon",
+    "gemini-3.8-flash",
+    "gemini-3.1-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+];
+
 fn short_id(len: usize) -> String {
     Uuid::new_v4().simple().to_string().chars().take(len).collect()
 }
@@ -22,8 +33,27 @@ fn short_id(len: usize) -> String {
 pub fn fallback_model_for(model: &str) -> Option<&'static str> {
     match model {
         "gemini-4-argon" => Some("gemini-3.8-flash"),
+        "gemini-3.1-pro-preview" => Some("gemini-3-flash-preview"),
         _ => None,
     }
+}
+
+fn parse_available_models_env() -> Vec<String> {
+    if let Ok(raw) = std::env::var("GEMINI_AVAILABLE_MODELS") {
+        let parsed: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| resolve_gemini_model(Some(s)))
+            .collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    DEFAULT_AVAILABLE_MODELS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
 }
 
 pub struct RouterMetrics {
@@ -45,6 +75,9 @@ struct MetricsInner {
     fallback_count: u64,
     active_model: String,
     default_model_override: Option<String>,
+    fast_model_override: Option<String>,
+    fallback_model: Option<String>,
+    available_models: Vec<String>,
     reasoning_effort: String,
     hot_swap_active: bool,
     last_client: Option<String>,
@@ -59,10 +92,23 @@ impl RouterMetrics {
         let env_model = std::env::var("ROUTER_DEFAULT_MODEL")
             .or_else(|_| std::env::var("GEMINI_PRIMARY_MODEL"))
             .ok()
-            .filter(|s| !s.trim().is_empty());
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| resolve_gemini_model(Some(s.trim())));
+        let fast_model = std::env::var("GEMINI_FAST_MODEL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| resolve_gemini_model(Some(s.trim())));
+        let fallback_model = std::env::var("GEMINI_FALLBACK_MODEL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| resolve_gemini_model(Some(s.trim())));
+        let mut available_models = parse_available_models_env();
         let active = env_model
             .clone()
-            .unwrap_or_else(|| DEFAULT_GEMINI_MODEL.to_string());
+            .unwrap_or_else(default_gemini_model);
+        if !available_models.contains(&active) {
+            available_models.insert(0, active.clone());
+        }
         let effort = std::env::var("GEMINI_REASONING_EFFORT")
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -85,6 +131,9 @@ impl RouterMetrics {
                 fallback_count: 0,
                 active_model: active,
                 default_model_override: env_model,
+                fast_model_override: fast_model,
+                fallback_model,
+                available_models,
                 reasoning_effort: effort,
                 hot_swap_active: hot_swap,
                 last_client: None,
@@ -158,7 +207,46 @@ impl RouterMetrics {
         let mut g = self.inner.lock().unwrap();
         g.default_model_override = Some(resolved.clone());
         g.active_model = resolved.clone();
+        if !g.available_models.contains(&resolved) {
+            g.available_models.insert(0, resolved.clone());
+        }
         resolved
+    }
+
+    pub fn set_fast_model(&self, model: Option<&str>) -> Option<String> {
+        let resolved = model
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| resolve_gemini_model(Some(s)));
+        let mut g = self.inner.lock().unwrap();
+        if let Some(ref m) = resolved {
+            if !g.available_models.contains(m) {
+                g.available_models.push(m.clone());
+            }
+        }
+        g.fast_model_override = resolved.clone();
+        resolved
+    }
+
+    pub fn set_fallback_model(&self, model: Option<&str>) -> Option<String> {
+        let resolved = model
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| resolve_gemini_model(Some(s)));
+        self.inner.lock().unwrap().fallback_model = resolved.clone();
+        resolved
+    }
+
+    pub fn set_available_models(&self, models: Vec<String>) {
+        let cleaned: Vec<String> = models
+            .into_iter()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .map(|m| resolve_gemini_model(Some(&m)))
+            .collect();
+        if !cleaned.is_empty() {
+            self.inner.lock().unwrap().available_models = cleaned;
+        }
     }
 
     pub fn set_reasoning_effort(&self, effort: &str) {
@@ -171,6 +259,18 @@ impl RouterMetrics {
 
     pub fn get_default_model_override(&self) -> Option<String> {
         self.inner.lock().unwrap().default_model_override.clone()
+    }
+
+    pub fn get_fast_model_override(&self) -> Option<String> {
+        self.inner.lock().unwrap().fast_model_override.clone()
+    }
+
+    pub fn get_fallback_model(&self) -> Option<String> {
+        self.inner.lock().unwrap().fallback_model.clone()
+    }
+
+    pub fn get_available_models(&self) -> Vec<String> {
+        self.inner.lock().unwrap().available_models.clone()
     }
 
     pub fn get_active_model(&self) -> String {
@@ -195,6 +295,9 @@ impl RouterMetrics {
             "tokens_out": g.tokens_out,
             "active_model": g.active_model,
             "default_model_override": g.default_model_override,
+            "fast_model_override": g.fast_model_override,
+            "fallback_model": g.fallback_model,
+            "available_models": g.available_models,
             "uptime_seconds": self.started_at.elapsed().as_secs(),
         })
     }
@@ -265,6 +368,8 @@ impl VertexGeminiUpstream {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(600))
             .connect_timeout(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(30))
+            .tcp_keepalive(Duration::from_secs(30))
             .build()
             .unwrap_or_default();
         Self {
@@ -310,41 +415,60 @@ impl VertexGeminiUpstream {
         model: &str,
         payload: &Value,
     ) -> std::result::Result<Value, UpstreamError> {
-        let url = self.build_endpoint_url(model, false).map_err(|e| UpstreamError {
-            status_code: 500,
-            message: e.to_string(),
-            details: None,
-        })?;
-        let headers = self.auth.get_auth_headers().await.map_err(|e| UpstreamError {
-            status_code: 401,
-            message: e.to_string(),
-            details: None,
-        })?;
+        for attempt in 0..2 {
+            let url = self.build_endpoint_url(model, false).map_err(|e| UpstreamError {
+                status_code: 500,
+                message: e.to_string(),
+                details: None,
+            })?;
 
-        let mut req = self.client.post(&url).json(payload);
-        for (k, v) in headers {
-            req = req.header(&k, &v);
-        }
+            let headers = self.auth.get_auth_headers().await.map_err(|e| UpstreamError {
+                status_code: 401,
+                message: e.to_string(),
+                details: None,
+            })?;
 
-        let resp = req.send().await.map_err(|e| UpstreamError {
-            status_code: 502,
-            message: e.to_string(),
-            details: None,
-        })?;
+            let mut req = self.client.post(&url).json(payload);
+            for (k, v) in headers {
+                req = req.header(&k, &v);
+            }
 
-        let status = resp.status().as_u16();
-        let text = resp.text().await.unwrap_or_default();
-        if status >= 400 {
-            let details = serde_json::from_str::<Value>(&text).ok();
-            return Err(UpstreamError {
-                status_code: status,
-                message: format!("Vertex AI error ({}): {}", status, text),
-                details,
+            let resp = req.send().await.map_err(|e| UpstreamError {
+                status_code: 502,
+                message: e.to_string(),
+                details: None,
+            })?;
+
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            if (status == 401 || status == 403) && attempt == 0 {
+                self.auth.prepare_auth_retry();
+                continue;
+            }
+            if status >= 400 {
+                if status == 401 {
+                    self.auth.record_auth_failure(status, &text);
+                }
+                let details = serde_json::from_str::<Value>(&text).ok();
+                return Err(UpstreamError {
+                    status_code: status,
+                    message: format!("Vertex AI error ({}): {}", status, text),
+                    details,
+                });
+            }
+            self.auth.clear_auth_failure();
+            return serde_json::from_str::<Value>(&text).map_err(|e| UpstreamError {
+                status_code: 502,
+                message: format!("Invalid JSON from Vertex AI: {}", e),
+                details: None,
             });
         }
-        serde_json::from_str::<Value>(&text).map_err(|e| UpstreamError {
-            status_code: 502,
-            message: format!("Invalid JSON from Vertex AI: {}", e),
+
+        self.auth
+            .record_auth_failure(401, "Vertex AI authentication failed after token refresh");
+        Err(UpstreamError {
+            status_code: 401,
+            message: "Vertex AI authentication failed after token refresh".to_string(),
             details: None,
         })
     }
@@ -355,38 +479,64 @@ impl VertexGeminiUpstream {
         payload: &Value,
     ) -> std::result::Result<mpsc::Receiver<std::result::Result<Value, UpstreamError>>, UpstreamError>
     {
-        let url = self.build_endpoint_url(model, true).map_err(|e| UpstreamError {
-            status_code: 500,
-            message: e.to_string(),
-            details: None,
-        })?;
-        let headers = self.auth.get_auth_headers().await.map_err(|e| UpstreamError {
-            status_code: 401,
-            message: e.to_string(),
-            details: None,
-        })?;
+        let mut resp_opt = None;
+        for attempt in 0..2 {
+            let url = self.build_endpoint_url(model, true).map_err(|e| UpstreamError {
+                status_code: 500,
+                message: e.to_string(),
+                details: None,
+            })?;
 
-        let mut req = self.client.post(&url).json(payload);
-        for (k, v) in headers {
-            req = req.header(&k, &v);
+            let headers = self.auth.get_auth_headers().await.map_err(|e| UpstreamError {
+                status_code: 401,
+                message: e.to_string(),
+                details: None,
+            })?;
+
+            let mut req = self.client.post(&url).json(payload);
+            for (k, v) in headers {
+                req = req.header(&k, &v);
+            }
+
+            let resp = req.send().await.map_err(|e| UpstreamError {
+                status_code: 502,
+                message: e.to_string(),
+                details: None,
+            })?;
+
+            let status = resp.status().as_u16();
+            if (status == 401 || status == 403) && attempt == 0 {
+                self.auth.prepare_auth_retry();
+                continue;
+            }
+            if status >= 400 {
+                let text = resp.text().await.unwrap_or_default();
+                if status == 401 {
+                    self.auth.record_auth_failure(status, &text);
+                }
+                let details = serde_json::from_str::<Value>(&text).ok();
+                return Err(UpstreamError {
+                    status_code: status,
+                    message: format!("Vertex AI stream error ({}): {}", status, text),
+                    details,
+                });
+            }
+            self.auth.clear_auth_failure();
+            resp_opt = Some(resp);
+            break;
         }
 
-        let mut resp = req.send().await.map_err(|e| UpstreamError {
-            status_code: 502,
-            message: e.to_string(),
-            details: None,
+        let mut resp = resp_opt.ok_or_else(|| {
+            self.auth.record_auth_failure(
+                401,
+                "Vertex AI stream authentication failed after token refresh",
+            );
+            UpstreamError {
+                status_code: 401,
+                message: "Vertex AI stream authentication failed after token refresh".to_string(),
+                details: None,
+            }
         })?;
-
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            let text = resp.text().await.unwrap_or_default();
-            let details = serde_json::from_str::<Value>(&text).ok();
-            return Err(UpstreamError {
-                status_code: status,
-                message: format!("Vertex AI stream error ({}): {}", status, text),
-                details,
-            });
-        }
 
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
@@ -448,19 +598,53 @@ impl RouterServer {
     }
 
     pub fn apply_model_override(&self, mut body: Value) -> Value {
-        if let Some(override_model) = self.metrics.get_default_model_override() {
-            if let Some(obj) = body.as_object_mut() {
-                let req_model = obj
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if req_model.is_empty() || !req_model.starts_with("gemini-") {
+        if let Some(obj) = body.as_object_mut() {
+            let req_model = obj
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let lower = req_model.to_ascii_lowercase();
+            let is_fast_tier = lower.contains("haiku") || lower.contains("mini");
+
+            if is_fast_tier {
+                if let Some(fast_override) = self.metrics.get_fast_model_override() {
+                    obj.insert("model".to_string(), Value::String(fast_override));
+                    return body;
+                }
+            }
+
+            if let Some(override_model) = self.metrics.get_default_model_override() {
+                if !is_fast_tier
+                    && (req_model.is_empty()
+                        || !req_model.starts_with("gemini-")
+                        || self.metrics.get_hot_swap_active())
+                {
                     obj.insert("model".to_string(), Value::String(override_model));
                 }
             }
         }
         body
+    }
+
+    pub fn resolve_fallback_model(&self, model: &str) -> Option<String> {
+        if let Some(configured) = self.metrics.get_fallback_model() {
+            if !configured.is_empty() && configured != model {
+                return Some(configured);
+            }
+        }
+        if let Ok(env_fb) = std::env::var("GEMINI_FALLBACK_MODEL") {
+            let trimmed = env_fb.trim();
+            if !trimmed.is_empty() {
+                let resolved = resolve_gemini_model(Some(trimmed));
+                if resolved != model {
+                    return Some(resolved);
+                }
+            }
+        }
+        fallback_model_for(model)
+            .map(|s| s.to_string())
+            .filter(|fb| fb != model)
     }
 
     pub async fn generate_with_fallback(
@@ -471,11 +655,60 @@ impl RouterServer {
         match self.upstream.generate_content(model, payload).await {
             Ok(resp) => Ok((model.to_string(), resp)),
             Err(err) => {
-                if let Some(fallback) = fallback_model_for(model) {
-                    if matches!(err.status_code, 400 | 404 | 429 | 500 | 503) {
-                        let resp = self.upstream.generate_content(fallback, payload).await?;
-                        return Ok((fallback.to_string(), resp));
+                if let Some(fallback) = self.resolve_fallback_model(model) {
+                    if matches!(err.status_code, 400 | 403 | 404 | 429 | 500 | 503) {
+                        self.metrics.inner.lock().unwrap().fallback_count += 1;
+                        match self.upstream.generate_content(&fallback, payload).await {
+                            Ok(resp) => return Ok((fallback, resp)),
+                            Err(fb_err) => {
+                                if fb_err.status_code == 401 || fb_err.status_code == 403 {
+                                    self.auth
+                                        .record_auth_failure(fb_err.status_code, &fb_err.message);
+                                }
+                                return Err(fb_err);
+                            }
+                        }
                     }
+                }
+                if err.status_code == 401 || err.status_code == 403 {
+                    self.auth.record_auth_failure(err.status_code, &err.message);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    pub async fn stream_with_fallback(
+        &self,
+        model: &str,
+        payload: &Value,
+    ) -> std::result::Result<
+        (
+            String,
+            mpsc::Receiver<std::result::Result<Value, UpstreamError>>,
+        ),
+        UpstreamError,
+    > {
+        match self.upstream.stream_generate_content(model, payload).await {
+            Ok(rx) => Ok((model.to_string(), rx)),
+            Err(err) => {
+                if let Some(fallback) = self.resolve_fallback_model(model) {
+                    if matches!(err.status_code, 400 | 403 | 404 | 429 | 500 | 503) {
+                        self.metrics.inner.lock().unwrap().fallback_count += 1;
+                        match self.upstream.stream_generate_content(&fallback, payload).await {
+                            Ok(rx) => return Ok((fallback, rx)),
+                            Err(fb_err) => {
+                                if fb_err.status_code == 401 || fb_err.status_code == 403 {
+                                    self.auth
+                                        .record_auth_failure(fb_err.status_code, &fb_err.message);
+                                }
+                                return Err(fb_err);
+                            }
+                        }
+                    }
+                }
+                if err.status_code == 401 || err.status_code == 403 {
+                    self.auth.record_auth_failure(err.status_code, &err.message);
                 }
                 Err(err)
             }
@@ -496,12 +729,14 @@ impl RouterServer {
                 let default_model = self
                     .metrics
                     .get_default_model_override()
-                    .unwrap_or_else(|| DEFAULT_GEMINI_MODEL.to_string());
-                let primary_model = if default_model.contains("4") || default_model.contains("argon") {
-                    "gemini-4-argon".to_string()
-                } else {
-                    default_model.clone()
-                };
+                    .unwrap_or_else(default_gemini_model);
+                let primary_model = default_model.clone();
+                let fast_model = self
+                    .metrics
+                    .get_fast_model_override()
+                    .unwrap_or_else(default_fast_gemini_model);
+                let fallback_model = self.resolve_fallback_model(&primary_model);
+                let available_models = self.metrics.get_available_models();
                 if let Some(obj) = status.as_object_mut() {
                     obj.insert("status".to_string(), Value::String("ok".to_string()));
                     obj.insert("adc".to_string(), adc_status);
@@ -512,6 +747,15 @@ impl RouterServer {
                     obj.insert(
                         "primary_model".to_string(),
                         Value::String(primary_model),
+                    );
+                    obj.insert("fast_model".to_string(), Value::String(fast_model));
+                    obj.insert(
+                        "fallback_model".to_string(),
+                        fallback_model.map(Value::String).unwrap_or(Value::Null),
+                    );
+                    obj.insert(
+                        "available_models".to_string(),
+                        json!(available_models),
                     );
                     obj.insert(
                         "reasoning_effort".to_string(),
@@ -536,8 +780,16 @@ impl RouterServer {
                         )
                     }
                 };
+                self.auth.invalidate_token();
                 if body.get("reset_stats").and_then(|v| v.as_bool()) == Some(true) {
                     self.metrics.reset();
+                }
+                if let Some(arr) = body.get("available_models").and_then(|v| v.as_array()) {
+                    let list: Vec<String> = arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
+                    self.metrics.set_available_models(list);
                 }
                 if let Some(m) = body
                     .get("default_model")
@@ -549,6 +801,20 @@ impl RouterServer {
                         if body.get("hot_swap").and_then(|v| v.as_bool()).unwrap_or(true) {
                             self.metrics.set_hot_swap_active(true);
                         }
+                    }
+                }
+                if let Some(fm) = body.get("fast_model") {
+                    if fm.is_null() {
+                        self.metrics.set_fast_model(None);
+                    } else if let Some(s) = fm.as_str() {
+                        self.metrics.set_fast_model(Some(s));
+                    }
+                }
+                if let Some(fb) = body.get("fallback_model") {
+                    if fb.is_null() {
+                        self.metrics.set_fallback_model(None);
+                    } else if let Some(s) = fb.as_str() {
+                        self.metrics.set_fallback_model(Some(s));
                     }
                 }
                 if let Some(e) = body.get("reasoning_effort").and_then(|v| v.as_str()) {
@@ -570,13 +836,21 @@ impl RouterServer {
                 let def_model = self
                     .metrics
                     .get_default_model_override()
-                    .unwrap_or_else(|| DEFAULT_GEMINI_MODEL.to_string());
+                    .unwrap_or_else(default_gemini_model);
+                let fast_model = self
+                    .metrics
+                    .get_fast_model_override()
+                    .unwrap_or_else(default_fast_gemini_model);
+                let fallback_model = self.resolve_fallback_model(&def_model);
                 RouterResponse::Json(
                     200,
                     json!({
                         "status": "updated",
                         "default_model": def_model,
                         "primary_model": def_model,
+                        "fast_model": fast_model,
+                        "fallback_model": fallback_model,
+                        "available_models": self.metrics.get_available_models(),
                         "reasoning_effort": self.metrics.get_reasoning_effort(),
                         "hot_swap_active": self.metrics.get_hot_swap_active(),
                         "active_model": self.metrics.get_active_model(),
@@ -586,15 +860,7 @@ impl RouterServer {
                 )
             }
             ("GET", "/models") | ("GET", "/v1/models") => {
-                let models = [
-                    "gemini-4-argon",
-                    "gemini-3.8-flash",
-                    "gemini-3.1-pro-preview",
-                    "gemini-3-flash-preview",
-                    "gemini-2.5-pro",
-                    "gemini-2.5-flash",
-                    "gemini-2.5-flash-lite",
-                ];
+                let models = self.metrics.get_available_models();
                 let data: Vec<Value> = models
                     .iter()
                     .map(|m| {
@@ -628,11 +894,12 @@ impl RouterServer {
                 let requested_model = body
                     .get("model")
                     .and_then(|v| v.as_str())
-                    .unwrap_or(DEFAULT_GEMINI_MODEL)
-                    .to_string();
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(default_gemini_model);
                 let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
                 let (gemini_model, gemini_payload) = anthropic_to_gemini_request(&body);
-                self.metrics.record_request(&gemini_model);
+                self.metrics
+                    .record_client_request("claude", &requested_model, &gemini_model);
 
                 if !stream {
                     match self
@@ -673,37 +940,16 @@ impl RouterServer {
                         }
                     }
                 } else {
-                    let (tx, rx) = mpsc::channel(64);
-                    let upstream = self.upstream.clone();
-                    let metrics = self.metrics.clone();
-                    tokio::spawn(async move {
-                        let mut state = AnthropicStreamState::new(&requested_model);
-                        let mut active_model = gemini_model.clone();
-                        let stream_res = match upstream
-                            .stream_generate_content(&active_model, &gemini_payload)
-                            .await
-                        {
-                            Ok(r) => Ok(r),
-                            Err(err) => {
-                                if let Some(fb) = fallback_model_for(&active_model) {
-                                    if matches!(err.status_code, 400 | 404 | 429 | 500 | 503) {
-                                        active_model = fb.to_string();
-                                        metrics.inner.lock().unwrap().active_model =
-                                            active_model.clone();
-                                        upstream
-                                            .stream_generate_content(&active_model, &gemini_payload)
-                                            .await
-                                    } else {
-                                        Err(err)
-                                    }
-                                } else {
-                                    Err(err)
-                                }
-                            }
-                        };
-
-                        match stream_res {
-                            Ok(mut chunk_rx) => {
+                    match self
+                        .stream_with_fallback(&gemini_model, &gemini_payload)
+                        .await
+                    {
+                        Ok((used_model, mut chunk_rx)) => {
+                            self.metrics.inner.lock().unwrap().active_model = used_model;
+                            let (tx, rx) = mpsc::channel(64);
+                            let metrics = self.metrics.clone();
+                            tokio::spawn(async move {
+                                let mut state = AnthropicStreamState::new(&requested_model);
                                 while let Some(item) = chunk_rx.recv().await {
                                     match item {
                                         Ok(chunk) => {
@@ -734,22 +980,23 @@ impl RouterServer {
                                     }
                                 }
                                 metrics.record_success(state.input_tokens, state.output_tokens);
-                            }
-                            Err(err) => {
-                                metrics.record_error();
-                                let _ = tx
-                                    .send(format_sse(
-                                        Some("error"),
-                                        &json!({
-                                            "type": "error",
-                                            "error": {"type": "api_error", "message": err.message},
-                                        }),
-                                    ))
-                                    .await;
-                            }
+                            });
+                            RouterResponse::Sse(rx)
                         }
-                    });
-                    RouterResponse::Sse(rx)
+                        Err(err) => {
+                            self.metrics.record_error();
+                            RouterResponse::Json(
+                                err.status_code,
+                                json!({
+                                    "type": "error",
+                                    "error": {
+                                        "type": "api_error",
+                                        "message": err.message,
+                                    }
+                                }),
+                            )
+                        }
+                    }
                 }
             }
             ("POST", "/chat/completions") | ("POST", "/v1/chat/completions") => {
@@ -766,11 +1013,12 @@ impl RouterServer {
                 let requested_model = body
                     .get("model")
                     .and_then(|v| v.as_str())
-                    .unwrap_or(DEFAULT_GEMINI_MODEL)
-                    .to_string();
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(default_gemini_model);
                 let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
                 let (gemini_model, gemini_payload) = openai_chat_to_gemini_request(&body);
-                self.metrics.record_request(&gemini_model);
+                self.metrics
+                    .record_client_request("chat", &requested_model, &gemini_model);
 
                 if !stream {
                     match self
@@ -809,26 +1057,26 @@ impl RouterServer {
                         }
                     }
                 } else {
-                    let (tx, rx) = mpsc::channel(64);
-                    let upstream = self.upstream.clone();
-                    let metrics = self.metrics.clone();
-                    tokio::spawn(async move {
-                        let chat_id = format!("chatcmpl-{}", short_id(24));
-                        let created = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let mut sent_role = false;
-                        let mut has_tool_calls = false;
-                        let mut tool_idx = 0usize;
-                        let mut tok_in = 0u64;
-                        let mut tok_out = 0u64;
+                    match self
+                        .stream_with_fallback(&gemini_model, &gemini_payload)
+                        .await
+                    {
+                        Ok((used_model, mut chunk_rx)) => {
+                            self.metrics.inner.lock().unwrap().active_model = used_model;
+                            let (tx, rx) = mpsc::channel(64);
+                            let metrics = self.metrics.clone();
+                            tokio::spawn(async move {
+                                let chat_id = format!("chatcmpl-{}", short_id(24));
+                                let created = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let mut sent_role = false;
+                                let mut has_tool_calls = false;
+                                let mut tool_idx = 0usize;
+                                let mut tok_in = 0u64;
+                                let mut tok_out = 0u64;
 
-                        match upstream
-                            .stream_generate_content(&gemini_model, &gemini_payload)
-                            .await
-                        {
-                            Ok(mut chunk_rx) => {
                                 while let Some(Ok(chunk)) = chunk_rx.recv().await {
                                     let (parts, _finish, usage) = extract_candidate_parts(&chunk);
                                     if let Some(pt) =
@@ -961,19 +1209,23 @@ impl RouterServer {
                                     .await;
                                 let _ = tx.send("data: [DONE]\n\n".to_string()).await;
                                 metrics.record_success(tok_in, tok_out);
-                            }
-                            Err(err) => {
-                                metrics.record_error();
-                                let _ = tx
-                                    .send(format_sse(
-                                        None,
-                                        &json!({"error": {"message": err.message}}),
-                                    ))
-                                    .await;
-                            }
+                            });
+                            RouterResponse::Sse(rx)
                         }
-                    });
-                    RouterResponse::Sse(rx)
+                        Err(err) => {
+                            self.metrics.record_error();
+                            RouterResponse::Json(
+                                err.status_code,
+                                json!({
+                                    "error": {
+                                        "message": err.message,
+                                        "type": "upstream_error",
+                                        "code": err.status_code,
+                                    }
+                                }),
+                            )
+                        }
+                    }
                 }
             }
             ("POST", "/responses") | ("POST", "/v1/responses") => {
@@ -990,11 +1242,12 @@ impl RouterServer {
                 let requested_model = body
                     .get("model")
                     .and_then(|v| v.as_str())
-                    .unwrap_or(DEFAULT_GEMINI_MODEL)
-                    .to_string();
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(default_gemini_model);
                 let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
                 let (gemini_model, gemini_payload) = openai_responses_to_gemini_request(&body);
-                self.metrics.record_request(&gemini_model);
+                self.metrics
+                    .record_client_request("codex", &requested_model, &gemini_model);
 
                 if !stream {
                     match self
@@ -1032,43 +1285,43 @@ impl RouterServer {
                         }
                     }
                 } else {
-                    let (tx, rx) = mpsc::channel(64);
-                    let upstream = self.upstream.clone();
-                    let metrics = self.metrics.clone();
-                    tokio::spawn(async move {
-                        let resp_id = format!("resp_{}", short_id(24));
-                        let msg_id = format!("msg_{}", short_id(24));
-                        let created = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let mut full_text = String::new();
-                        let mut output_items: Vec<Value> = Vec::new();
-                        let mut tok_in = 0u64;
-                        let mut tok_out = 0u64;
+                    match self
+                        .stream_with_fallback(&gemini_model, &gemini_payload)
+                        .await
+                    {
+                        Ok((used_model, mut chunk_rx)) => {
+                            self.metrics.inner.lock().unwrap().active_model = used_model;
+                            let (tx, rx) = mpsc::channel(64);
+                            let metrics = self.metrics.clone();
+                            tokio::spawn(async move {
+                                let resp_id = format!("resp_{}", short_id(24));
+                                let msg_id = format!("msg_{}", short_id(24));
+                                let created = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let mut full_text = String::new();
+                                let mut output_items: Vec<Value> = Vec::new();
+                                let mut tok_in = 0u64;
+                                let mut tok_out = 0u64;
 
-                        let _ = tx
-                            .send(format_sse(
-                                Some("response.created"),
-                                &json!({
-                                    "type": "response.created",
-                                    "response": {
-                                        "id": resp_id,
-                                        "object": "response",
-                                        "created_at": created,
-                                        "status": "in_progress",
-                                        "model": requested_model,
-                                        "output": [],
-                                    }
-                                }),
-                            ))
-                            .await;
+                                let _ = tx
+                                    .send(format_sse(
+                                        Some("response.created"),
+                                        &json!({
+                                            "type": "response.created",
+                                            "response": {
+                                                "id": resp_id,
+                                                "object": "response",
+                                                "created_at": created,
+                                                "status": "in_progress",
+                                                "model": requested_model,
+                                                "output": [],
+                                            }
+                                        }),
+                                    ))
+                                    .await;
 
-                        match upstream
-                            .stream_generate_content(&gemini_model, &gemini_payload)
-                            .await
-                        {
-                            Ok(mut chunk_rx) => {
                                 while let Some(Ok(chunk)) = chunk_rx.recv().await {
                                     let (parts, _finish, usage) = extract_candidate_parts(&chunk);
                                     if let Some(pt) =
@@ -1199,19 +1452,23 @@ impl RouterServer {
                                     ))
                                     .await;
                                 metrics.record_success(tok_in, tok_out);
-                            }
-                            Err(err) => {
-                                metrics.record_error();
-                                let _ = tx
-                                    .send(format_sse(
-                                        Some("error"),
-                                        &json!({"type": "error", "error": {"message": err.message}}),
-                                    ))
-                                    .await;
-                            }
+                            });
+                            RouterResponse::Sse(rx)
                         }
-                    });
-                    RouterResponse::Sse(rx)
+                        Err(err) => {
+                            self.metrics.record_error();
+                            RouterResponse::Json(
+                                err.status_code,
+                                json!({
+                                    "error": {
+                                        "message": err.message,
+                                        "type": "upstream_error",
+                                        "code": err.status_code,
+                                    }
+                                }),
+                            )
+                        }
+                    }
                 }
             }
             _ => RouterResponse::Json(

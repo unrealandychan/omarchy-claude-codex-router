@@ -1,3 +1,6 @@
+use omarchy_claude_codex_router::translator::{
+    format_model_display_name, format_model_short_badge, format_model_short_label,
+};
 use regex::Regex;
 use serde_json::{json, Map, Value};
 use std::env;
@@ -12,7 +15,7 @@ use std::time::{Duration, Instant};
 
 const MAX_OUTPUT_BYTES: u64 = 1_048_576; // 1 MiB
 const VALID_TARGETS: &[&str] = &["claude", "codex", "both"];
-const VALID_MODELS: &[&str] = &["gemini-3.8-flash", "gemini-4-argon"];
+const DEFAULT_PRESET_MODELS: &[&str] = &["gemini-3.8-flash", "gemini-4-argon"];
 const VALID_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
 
 const CODEX_BLOCK_BEGIN: &str = "# BEGIN OMARCHY_GEMINI_ADC_ROUTER";
@@ -308,18 +311,82 @@ fn run_cmd(args: &[&str], timeout: Duration) -> (i32, String, String) {
     }
 }
 
+fn default_available_models() -> Vec<String> {
+    if let Ok(raw) = env::var("GEMINI_AVAILABLE_MODELS") {
+        let mut parsed = Vec::new();
+        for part in raw.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                if let Ok(norm) = normalize_model(Some(trimmed)) {
+                    if !parsed.contains(&norm) {
+                        parsed.push(norm);
+                    }
+                }
+            }
+        }
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    DEFAULT_PRESET_MODELS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+fn get_state_available_models(state: &Map<String, Value>) -> Vec<String> {
+    let mut models: Vec<String> = state
+        .get("available_models")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(|s| normalize_model(Some(s)).ok())
+                .collect::<Vec<String>>()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(default_available_models);
+
+    if let Some(pm) = state.get("primary_model").and_then(|v| v.as_str()) {
+        if let Ok(norm_pm) = normalize_model(Some(pm)) {
+            if !models.contains(&norm_pm) {
+                models.push(norm_pm);
+            }
+        }
+    }
+    models
+}
+
+fn ensure_model_in_state_available(state: &mut Map<String, Value>, model: &str) {
+    let mut models = get_state_available_models(state);
+    if !models.iter().any(|m| m == model) {
+        models.push(model.to_string());
+    }
+    state.insert("available_models".to_string(), json!(models));
+}
+
 fn load_state() -> Result<Map<String, Value>, String> {
     let paths = get_paths();
     let raw = read_file_safely(&paths.state_file)?;
     let mut default_state = Map::new();
+    let initial_primary = env::var("GEMINI_PRIMARY_MODEL")
+        .ok()
+        .and_then(|s| normalize_model(Some(&s)).ok())
+        .unwrap_or_else(|| "gemini-3.8-flash".to_string());
     default_state.insert(
         "primary_model".to_string(),
-        Value::String("gemini-3.8-flash".to_string()),
+        Value::String(initial_primary),
     );
     default_state.insert(
         "reasoning_effort".to_string(),
         Value::String("medium".to_string()),
     );
+    default_state.insert(
+        "available_models".to_string(),
+        json!(default_available_models()),
+    );
+    default_state.insert("fast_model".to_string(), Value::Null);
+    default_state.insert("fallback_model".to_string(), Value::Null);
     default_state.insert("claude_backup_env".to_string(), Value::Null);
     default_state.insert("codex_backup".to_string(), Value::Null);
 
@@ -330,6 +397,8 @@ fn load_state() -> Result<Map<String, Value>, String> {
             }
         }
     }
+    let avail = get_state_available_models(&default_state);
+    default_state.insert("available_models".to_string(), json!(avail));
     Ok(default_state)
 }
 
@@ -348,54 +417,117 @@ fn save_state(state: &Map<String, Value>) -> Result<(), String> {
         .get("reasoning_effort")
         .and_then(|v| v.as_str())
         .unwrap_or("medium");
-    let env_content = format!(
-        "GEMINI_PRIMARY_MODEL={}\nGEMINI_REASONING_EFFORT={}\nROUTER_PORT={}\n",
+    let avail = get_state_available_models(state);
+    let mut env_content = format!(
+        "GEMINI_PRIMARY_MODEL={}\nGEMINI_REASONING_EFFORT={}\nGEMINI_AVAILABLE_MODELS={}\nROUTER_PORT={}\n",
         primary_model,
         effort,
+        avail.join(","),
         router_port()
     );
+    if let Some(fast) = state
+        .get("fast_model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        env_content.push_str(&format!("GEMINI_FAST_MODEL={}\n", fast));
+    }
+    if let Some(fb) = state
+        .get("fallback_model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        env_content.push_str(&format!("GEMINI_FALLBACK_MODEL={}\n", fb));
+    }
     write_file_safely(&paths.env_file, &env_content, 0o600)
+}
+
+fn is_safe_model_identifier(s: &str) -> bool {
+    if s.len() < 2 || s.len() > 80 {
+        return false;
+    }
+    if s.contains("..")
+        || s.starts_with('.')
+        || s.starts_with('-')
+        || s.ends_with('.')
+        || s.ends_with('-')
+    {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
 }
 
 fn normalize_model(model: Option<&str>) -> Result<String, String> {
     let Some(m) = model else {
         return Ok("gemini-3.8-flash".to_string());
     };
-    let lowered = m.trim().to_lowercase();
+    let trimmed = m.trim();
+    let stripped = match trimmed.find('[') {
+        Some(idx) => trimmed[..idx].trim(),
+        None => trimmed,
+    };
+    let lowered = stripped.to_lowercase();
     if lowered.is_empty() {
         return Ok("gemini-3.8-flash".to_string());
     }
-    // Strict validation against path traversal or injection characters
-    if lowered.contains('/') || lowered.contains('\\') || lowered.contains("..") || lowered.contains(';') {
+    // Strict validation against path traversal or shell injection characters
+    if !is_safe_model_identifier(&lowered) {
         return Err(format!(
-            "Invalid model '{}'. Allowed: {}",
-            m,
-            VALID_MODELS.join(", ")
+            "Invalid model '{}'. Must be a valid Gemini model ID (e.g. gemini-3.8-flash, gemini-4-argon, gemini-3.1-pro-preview, gemini-2.5-pro)",
+            m
         ));
     }
-    if lowered == "gemini-4.0"
-        || lowered == "gemini-4.0-pro"
-        || lowered == "gemini-4-argon"
-        || lowered == "4.0"
-        || lowered == "argon"
-        || lowered == "pro"
-    {
-        return Ok("gemini-4-argon".to_string());
+    // Check user-defined GEMINI_MODEL_ALIASES="alias=target,..."
+    if let Ok(aliases_raw) = env::var("GEMINI_MODEL_ALIASES") {
+        for pair in aliases_raw.split(',') {
+            if let Some((k, v)) = pair.split_once('=') {
+                let alias_key = k.trim().to_lowercase();
+                let alias_val = v.trim().to_lowercase();
+                if alias_key == lowered && is_safe_model_identifier(&alias_val) {
+                    return Ok(alias_val);
+                }
+            }
+        }
     }
-    if lowered == "gemini-3.8"
-        || lowered == "gemini-3.8-flash"
-        || lowered == "3.8"
-        || lowered == "flash"
-    {
-        return Ok("gemini-3.8-flash".to_string());
+    match lowered.as_str() {
+        "gemini-4.0" | "gemini-4.0-pro" | "gemini-4-argon" | "4.0" | "4" | "argon" | "pro" => {
+            return Ok("gemini-4-argon".to_string());
+        }
+        "gemini-3.8" | "gemini-3.8-flash" | "3.8" | "flash" => {
+            return Ok("gemini-3.8-flash".to_string());
+        }
+        "gemini-3.1"
+        | "gemini-3.1-pro"
+        | "gemini-3.1-pro-preview"
+        | "3.1"
+        | "3.1-pro" => {
+            return Ok("gemini-3.1-pro-preview".to_string());
+        }
+        "gemini-3.0-flash"
+        | "gemini-3-flash"
+        | "gemini-3-flash-preview"
+        | "3.0-flash"
+        | "3-flash" => {
+            return Ok("gemini-3-flash-preview".to_string());
+        }
+        "gemini-2.5" | "gemini-2.5-pro" | "2.5-pro" | "2.5" => {
+            return Ok("gemini-2.5-pro".to_string());
+        }
+        "gemini-2.5-flash" | "2.5-flash" => {
+            return Ok("gemini-2.5-flash".to_string());
+        }
+        "gemini-2.5-flash-lite" | "2.5-flash-lite" | "flash-lite" => {
+            return Ok("gemini-2.5-flash-lite".to_string());
+        }
+        _ => {}
     }
-    if VALID_MODELS.contains(&lowered.as_str()) {
+    if lowered.starts_with("gemini-") {
         return Ok(lowered);
     }
     Err(format!(
-        "Invalid model '{}'. Allowed: {}",
-        m,
-        VALID_MODELS.join(", ")
+        "Invalid model '{}'. Allowed: any 'gemini-*' model ID or alias (3.8, flash, 4.0, argon, 3.1-pro, 3-flash, 2.5-pro, 2.5-flash)",
+        m
     ))
 }
 
@@ -784,13 +916,39 @@ fn fetch_router_health(timeout: Duration) -> Option<Map<String, Value>> {
     None
 }
 
-fn push_router_config(primary_model: &str, reasoning_effort: &str, hot_swap: bool) -> bool {
-    let payload = json!({
+fn push_router_config(state: &Map<String, Value>, hot_swap: bool) -> bool {
+    let primary_model = state
+        .get("primary_model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("gemini-3.8-flash");
+    let reasoning_effort = state
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .unwrap_or("medium");
+    let available_models = get_state_available_models(state);
+    let mut payload_obj = json!({
         "primary_model": primary_model,
         "reasoning_effort": reasoning_effort,
+        "available_models": available_models,
         "hot_swap": hot_swap,
-    })
-    .to_string();
+    });
+    if let Some(obj) = payload_obj.as_object_mut() {
+        if let Some(fm) = state
+            .get("fast_model")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            obj.insert("fast_model".to_string(), Value::String(fm.to_string()));
+        }
+        if let Some(fb) = state
+            .get("fallback_model")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            obj.insert("fallback_model".to_string(), Value::String(fb.to_string()));
+        }
+    }
+    let payload = payload_obj.to_string();
     matches!(
         local_http_request("POST", "/config", Some(&payload), Duration::from_secs(2)),
         Some((200, _))
@@ -845,7 +1003,7 @@ fn start_router_daemon(state: &Map<String, Value>) -> (bool, String) {
 
     if let Some(health) = fetch_router_health(Duration::from_secs(1)) {
         if health.get("status").and_then(|v| v.as_str()) == Some("ok") {
-            push_router_config(primary_model, reasoning_effort, true);
+            push_router_config(state, true);
             return (true, "already-running".to_string());
         }
     }
@@ -862,7 +1020,7 @@ fn start_router_daemon(state: &Map<String, Value>) -> (bool, String) {
     if rc == 0 {
         for _ in 0..20 {
             if fetch_router_health(Duration::from_millis(500)).is_some() {
-                push_router_config(primary_model, reasoning_effort, true);
+                push_router_config(state, true);
                 return (true, "systemd".to_string());
             }
             thread::sleep(Duration::from_millis(200));
@@ -898,16 +1056,24 @@ fn start_router_daemon(state: &Map<String, Value>) -> (bool, String) {
     };
 
     let port_s = router_port().to_string();
-    let spawn_res = Command::new(&router_bin)
-        .args(["--host", "127.0.0.1", "--port", &port_s])
+    let available_csv = get_state_available_models(state).join(",");
+    let mut cmd = Command::new(&router_bin);
+    cmd.args(["--host", "127.0.0.1", "--port", &port_s])
         .current_dir(&paths.project_dir)
         .env("GEMINI_PRIMARY_MODEL", primary_model)
         .env("GEMINI_REASONING_EFFORT", reasoning_effort)
+        .env("GEMINI_AVAILABLE_MODELS", &available_csv)
         .env("ROUTER_PORT", &port_s)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_err))
-        .spawn();
+        .stderr(Stdio::from(log_err));
+    if let Some(fm) = state.get("fast_model").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        cmd.env("GEMINI_FAST_MODEL", fm);
+    }
+    if let Some(fb) = state.get("fallback_model").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        cmd.env("GEMINI_FALLBACK_MODEL", fb);
+    }
+    let spawn_res = cmd.spawn();
 
     if let Err(e) = spawn_res {
         return (false, format!("Failed to spawn router: {}", e));
@@ -915,7 +1081,7 @@ fn start_router_daemon(state: &Map<String, Value>) -> (bool, String) {
 
     for _ in 0..25 {
         if fetch_router_health(Duration::from_millis(500)).is_some() {
-            push_router_config(primary_model, reasoning_effort, true);
+            push_router_config(state, true);
             return (true, "background-process".to_string());
         }
         thread::sleep(Duration::from_millis(200));
@@ -1131,36 +1297,57 @@ fn build_status_dict() -> Result<Map<String, Value>, String> {
     let claude_on = is_claude_routed()?;
     let codex_on = is_codex_routed()?;
 
-    let is_g4 = primary_model.contains('4');
-    let short_model = if is_g4 { "Gemini 4.0" } else { "Gemini 3.8" };
+    let short_model = format_model_short_label(&primary_model);
+    let short_badge = format_model_short_badge(&primary_model);
+    let display_model = format_model_display_name(&primary_model);
+
     let (status_label, badge_text) = if claude_on && codex_on {
         (
             format!("Claude + Codex -> {}", short_model),
-            if is_g4 { "C+X -> G4" } else { "C+X -> G3.8" }.to_string(),
+            format!("C+X -> {}", short_badge),
         )
     } else if claude_on {
         (
             format!("Claude -> {}", short_model),
-            if is_g4 {
-                "Claude -> G4"
-            } else {
-                "Claude -> G3.8"
-            }
-            .to_string(),
+            format!("Claude -> {}", short_badge),
         )
     } else if codex_on {
         (
             format!("Codex -> {}", short_model),
-            if is_g4 {
-                "Codex -> G4"
-            } else {
-                "Codex -> G3.8"
-            }
-            .to_string(),
+            format!("Codex -> {}", short_badge),
         )
     } else {
         ("Direct (Routing Off)".to_string(), "ADC Off".to_string())
     };
+
+    let mut available_models = get_state_available_models(&state);
+    if !available_models.contains(&primary_model) {
+        available_models.push(primary_model.clone());
+    }
+    let model_presets: Vec<Value> = available_models
+        .iter()
+        .map(|m| {
+            json!({
+                "id": m,
+                "label": format_model_display_name(m),
+                "short": format_model_short_label(m),
+                "badge": format_model_short_badge(m),
+            })
+        })
+        .collect();
+
+    let fast_model = state
+        .get("fast_model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| Value::String(s.to_string()))
+        .unwrap_or(Value::Null);
+    let fallback_model = state
+        .get("fallback_model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| Value::String(s.to_string()))
+        .unwrap_or(Value::Null);
 
     let val = json!({
         "ok": true,
@@ -1175,6 +1362,13 @@ fn build_status_dict() -> Result<Map<String, Value>, String> {
         "claude_installed": which_in_path("claude"),
         "codex_installed": which_in_path("codex"),
         "primary_model": primary_model,
+        "primary_model_display": display_model,
+        "primary_model_short": short_model,
+        "primary_model_badge": short_badge,
+        "available_models": available_models,
+        "model_presets": model_presets,
+        "fast_model": fast_model,
+        "fallback_model": fallback_model,
         "reasoning_effort": reasoning_effort,
         "hot_swap_active": hot_swap_active,
         "status_label": status_label,
@@ -1199,10 +1393,9 @@ fn cmd_enable(
 
     let mut state = load_state()?;
     if let Some(m) = model_arg {
-        state.insert(
-            "primary_model".to_string(),
-            Value::String(normalize_model(Some(m))?),
-        );
+        let norm_m = normalize_model(Some(m))?;
+        ensure_model_in_state_available(&mut state, &norm_m);
+        state.insert("primary_model".to_string(), Value::String(norm_m));
     }
     if let Some(e) = effort_arg {
         state.insert(
@@ -1303,24 +1496,91 @@ fn cmd_set_model(
     model_arg: Option<&str>,
     effort_arg: Option<&str>,
     flip: bool,
+    add_model_arg: Option<&str>,
+    remove_model_arg: Option<&str>,
+    models_csv_arg: Option<&str>,
+    fast_model_arg: Option<&str>,
+    fallback_model_arg: Option<&str>,
 ) -> Result<Map<String, Value>, String> {
     let mut state = load_state()?;
+
+    if let Some(csv) = models_csv_arg {
+        let mut parsed = Vec::new();
+        for item in csv.split(',') {
+            let trimmed = item.trim();
+            if !trimmed.is_empty() {
+                let norm = normalize_model(Some(trimmed))?;
+                if !parsed.contains(&norm) {
+                    parsed.push(norm);
+                }
+            }
+        }
+        if !parsed.is_empty() {
+            state.insert(
+                "available_models".to_string(),
+                Value::Array(parsed.into_iter().map(Value::String).collect()),
+            );
+        }
+    }
+
+    if let Some(add_m) = add_model_arg {
+        let norm_add = normalize_model(Some(add_m))?;
+        ensure_model_in_state_available(&mut state, &norm_add);
+    }
+
+    if let Some(rem_m) = remove_model_arg {
+        let norm_rem = normalize_model(Some(rem_m)).unwrap_or_else(|_| rem_m.trim().to_string());
+        let mut models = get_state_available_models(&state);
+        models.retain(|m| m != &norm_rem);
+        if !models.is_empty() {
+            state.insert(
+                "available_models".to_string(),
+                Value::Array(models.into_iter().map(Value::String).collect()),
+            );
+        }
+    }
+
+    if let Some(fm) = fast_model_arg {
+        if fm.trim().is_empty() || fm.eq_ignore_ascii_case("default") {
+            state.insert("fast_model".to_string(), Value::Null);
+        } else {
+            let norm_fm = normalize_model(Some(fm))?;
+            state.insert("fast_model".to_string(), Value::String(norm_fm));
+        }
+    }
+
+    if let Some(fb) = fallback_model_arg {
+        if fb.trim().is_empty() || fb.eq_ignore_ascii_case("default") {
+            state.insert("fallback_model".to_string(), Value::Null);
+        } else {
+            let norm_fb = normalize_model(Some(fb))?;
+            state.insert("fallback_model".to_string(), Value::String(norm_fb));
+        }
+    }
+
     if flip {
         let current = state
             .get("primary_model")
             .and_then(|v| v.as_str())
-            .unwrap_or("gemini-3.8-flash");
-        let next = if current.contains('4') {
-            "gemini-3.8-flash"
+            .unwrap_or("gemini-3.8-flash")
+            .to_string();
+        let models = get_state_available_models(&state);
+        let next = if models.is_empty() {
+            if current.contains('4') {
+                "gemini-3.8-flash".to_string()
+            } else {
+                "gemini-4-argon".to_string()
+            }
+        } else if let Some(idx) = models.iter().position(|m| m == &current) {
+            models[(idx + 1) % models.len()].clone()
         } else {
-            "gemini-4-argon"
+            models[0].clone()
         };
-        state.insert("primary_model".to_string(), Value::String(next.to_string()));
+        state.insert("primary_model".to_string(), Value::String(next));
     } else if let Some(m) = model_arg {
-        state.insert(
-            "primary_model".to_string(),
-            Value::String(normalize_model(Some(m))?),
-        );
+        let norm_m = normalize_model(Some(m))?;
+        ensure_model_in_state_available(&mut state, &norm_m);
+        state.insert("primary_model".to_string(), Value::String(norm_m));
     }
     if let Some(e) = effort_arg {
         state.insert(
@@ -1348,7 +1608,7 @@ fn cmd_set_model(
     }
 
     save_state(&state)?;
-    push_router_config(&primary_model, &reasoning_effort, true);
+    push_router_config(&state, true);
     build_status_dict()
 }
 
@@ -1434,6 +1694,16 @@ fn cmd_logs(lines: usize) -> Result<Map<String, Value>, String> {
     Ok(val.as_object().unwrap().clone())
 }
 
+fn cmd_refresh_auth() -> Result<Map<String, Value>, String> {
+    let _ = local_http_request(
+        "POST",
+        "/config",
+        Some(r#"{"refresh_auth":true}"#),
+        Duration::from_secs(2),
+    );
+    build_status_dict()
+}
+
 fn cmd_adc_login() -> Result<Map<String, Value>, String> {
     let Some(gcloud_path) = resolve_binary_in_path("gcloud") else {
         let val = json!({
@@ -1444,47 +1714,48 @@ fn cmd_adc_login() -> Result<Map<String, Value>, String> {
         return Ok(val.as_object().unwrap().clone());
     };
     let gcloud_bin = gcloud_path.to_string_lossy().to_string();
+    let refresh_url = format!("{}/config", router_url());
+    let login_script = format!(
+        "'{}' auth application-default login; curl -s -X POST '{}' -H 'Content-Type: application/json' -d '{{\"refresh_auth\":true}}' >/dev/null 2>&1 || true",
+        gcloud_bin.replace('\'', "'\\''"),
+        refresh_url
+    );
 
     let candidates: Vec<Vec<String>> = vec![
         vec![
             "uwsm-app".to_string(),
             "--".to_string(),
             "xdg-terminal-exec".to_string(),
-            gcloud_bin.clone(),
-            "auth".to_string(),
-            "application-default".to_string(),
-            "login".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            login_script.clone(),
         ],
         vec![
             "xdg-terminal-exec".to_string(),
-            gcloud_bin.clone(),
-            "auth".to_string(),
-            "application-default".to_string(),
-            "login".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            login_script.clone(),
         ],
         vec![
             "ghostty".to_string(),
             "-e".to_string(),
-            gcloud_bin.clone(),
-            "auth".to_string(),
-            "application-default".to_string(),
-            "login".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            login_script.clone(),
         ],
         vec![
             "kitty".to_string(),
             "-e".to_string(),
-            gcloud_bin.clone(),
-            "auth".to_string(),
-            "application-default".to_string(),
-            "login".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            login_script.clone(),
         ],
         vec![
             "alacritty".to_string(),
             "-e".to_string(),
-            gcloud_bin,
-            "auth".to_string(),
-            "application-default".to_string(),
-            "login".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            login_script,
         ],
     ];
 
@@ -1509,6 +1780,12 @@ fn cmd_adc_login() -> Result<Map<String, Value>, String> {
                 .spawn()
                 .is_ok()
             {
+                let _ = local_http_request(
+                    "POST",
+                    "/config",
+                    Some(r#"{"refresh_auth":true}"#),
+                    Duration::from_secs(1),
+                );
                 let val = json!({
                     "ok": true,
                     "launched": true,
@@ -1538,6 +1815,11 @@ fn dispatch_cli() -> Result<Map<String, Value>, String> {
     let mut model: Option<String> = None;
     let mut effort: Option<String> = None;
     let mut flip = false;
+    let mut add_model: Option<String> = None;
+    let mut remove_model: Option<String> = None;
+    let mut models_csv: Option<String> = None;
+    let mut fast_model: Option<String> = None;
+    let mut fallback_model: Option<String> = None;
     let mut lines: usize = 40;
 
     let mut i = 1;
@@ -1573,6 +1855,51 @@ fn dispatch_cli() -> Result<Map<String, Value>, String> {
             "--flip" => {
                 flip = true;
             }
+            "--add-model" => {
+                i += 1;
+                if i < args.len() {
+                    add_model = Some(args[i].clone());
+                }
+            }
+            arg if arg.starts_with("--add-model=") => {
+                add_model = Some(arg["--add-model=".len()..].to_string());
+            }
+            "--remove-model" => {
+                i += 1;
+                if i < args.len() {
+                    remove_model = Some(args[i].clone());
+                }
+            }
+            arg if arg.starts_with("--remove-model=") => {
+                remove_model = Some(arg["--remove-model=".len()..].to_string());
+            }
+            "--models" => {
+                i += 1;
+                if i < args.len() {
+                    models_csv = Some(args[i].clone());
+                }
+            }
+            arg if arg.starts_with("--models=") => {
+                models_csv = Some(arg["--models=".len()..].to_string());
+            }
+            "--fast-model" => {
+                i += 1;
+                if i < args.len() {
+                    fast_model = Some(args[i].clone());
+                }
+            }
+            arg if arg.starts_with("--fast-model=") => {
+                fast_model = Some(arg["--fast-model=".len()..].to_string());
+            }
+            "--fallback-model" => {
+                i += 1;
+                if i < args.len() {
+                    fallback_model = Some(args[i].clone());
+                }
+            }
+            arg if arg.starts_with("--fallback-model=") => {
+                fallback_model = Some(arg["--fallback-model=".len()..].to_string());
+            }
             "--lines" => {
                 i += 1;
                 if i < args.len() {
@@ -1592,12 +1919,22 @@ fn dispatch_cli() -> Result<Map<String, Value>, String> {
         "enable" => cmd_enable(&target, model.as_deref(), effort.as_deref()),
         "disable" => cmd_disable(&target),
         "toggle" => cmd_toggle(&target),
-        "set-model" => cmd_set_model(model.as_deref(), effort.as_deref(), flip),
+        "set-model" => cmd_set_model(
+            model.as_deref(),
+            effort.as_deref(),
+            flip,
+            add_model.as_deref(),
+            remove_model.as_deref(),
+            models_csv.as_deref(),
+            fast_model.as_deref(),
+            fallback_model.as_deref(),
+        ),
         "start-router" => cmd_start_router(),
         "stop-router" => cmd_stop_router(),
         "restart-router" => cmd_restart_router(),
         "logs" => cmd_logs(lines),
         "adc-login" => cmd_adc_login(),
+        "refresh-auth" => cmd_refresh_auth(),
         other => Err(format!("Unknown subcommand: '{}'", other)),
     }
 }

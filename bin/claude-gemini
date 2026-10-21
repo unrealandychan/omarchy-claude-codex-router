@@ -4,6 +4,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ROUTER_ENV_FILE="${HOME}/.config/omarchy/gemini-router/router.env"
+if [[ -f "${ROUTER_ENV_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${ROUTER_ENV_FILE}"
+fi
 ROUTER_PORT="${ROUTER_PORT:-4000}"
 ROUTER_URL="http://127.0.0.1:${ROUTER_PORT}"
 
@@ -20,6 +25,14 @@ while [[ $# -gt 0 ]]; do
     --4.0|--argon|--pro)
       PRIMARY_MODEL="gemini-4-argon"
       shift
+      ;;
+    --model)
+      if [[ $# -ge 2 ]]; then
+        PRIMARY_MODEL="$2"
+        shift 2
+      else
+        shift
+      fi
       ;;
     --model=*)
       PRIMARY_MODEL="${1#*=}"

@@ -143,6 +143,22 @@ RES_FLIP="$("${CTL}" set-model --flip)"
 assert_eq "$(json_field "${RES_FLIP}" "data['primary_model']")" "gemini-3.8-flash" "set-model --flip flips gemini-4-argon -> gemini-3.8-flash"
 assert_eq "$(json_field "${RES_FLIP}" "'total_requests' in data['stats']")" "True" "status includes stats.total_requests"
 
+echo "==> 5b. Dynamic model selection, custom aliases, and multi-model flip cycling"
+RES_CUSTOM="$("${CTL}" set-model --model gemini-2.5-pro)"
+assert_eq "$(json_field "${RES_CUSTOM}" "data['primary_model']")" "gemini-2.5-pro" "Dynamic model updated to gemini-2.5-pro"
+assert_eq "$(json_field "${RES_CUSTOM}" "data['badge_text']")" "C+X -> G2.5P" "Dynamic badge shows C+X -> G2.5P"
+assert_eq "$(json_field "${RES_CUSTOM}" "'gemini-2.5-pro' in data['available_models']")" "True" "gemini-2.5-pro added to available_models"
+
+RES_FLIP_1="$("${CTL}" set-model --flip)"
+assert_eq "$(json_field "${RES_FLIP_1}" "data['primary_model']")" "gemini-3.8-flash" "Multi-model flip cycles gemini-2.5-pro -> gemini-3.8-flash"
+RES_FLIP_2="$("${CTL}" set-model --flip)"
+assert_eq "$(json_field "${RES_FLIP_2}" "data['primary_model']")" "gemini-4-argon" "Multi-model flip cycles gemini-3.8-flash -> gemini-4-argon"
+RES_FLIP_3="$("${CTL}" set-model --flip)"
+assert_eq "$(json_field "${RES_FLIP_3}" "data['primary_model']")" "gemini-2.5-pro" "Multi-model flip cycles gemini-4-argon -> gemini-2.5-pro"
+
+RES_REM="$("${CTL}" set-model --remove-model gemini-2.5-pro --model gemini-3.8-flash)"
+assert_eq "$(json_field "${RES_REM}" "data['primary_model']")" "gemini-3.8-flash" "Removed custom model and reset to gemini-3.8-flash"
+
 echo "==> 6. Disable both and verify lossless restoration of pre-existing configs"
 RES_DISABLE="$("${CTL}" disable --target both)"
 assert_eq "$(json_field "${RES_DISABLE}" "data['claude_enabled']")" "False" "Claude disabled"

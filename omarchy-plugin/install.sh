@@ -21,7 +21,9 @@ mkdir -p "${CONFIG_DIR}" "${BIN_DIR}" "${SYSTEMD_USER_DIR}"
 
 # Build or locate Rust release binaries
 if [[ -z "${CARGO_TARGET_DIR:-}" ]]; then
-  if [[ -f "/tmp/cargo-target-router/release/claude-gemini-router" ]]; then
+  if [[ -f "/tmp/omarchy-router-target/release/claude-gemini-router" ]]; then
+    CARGO_TARGET_DIR="/tmp/omarchy-router-target"
+  elif [[ -f "/tmp/cargo-target-router/release/claude-gemini-router" ]]; then
     CARGO_TARGET_DIR="/tmp/cargo-target-router"
   else
     CARGO_TARGET_DIR="${PROJECT_DIR}/target"

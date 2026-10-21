@@ -8,8 +8,9 @@ An Omarchy status bar widget (`Quickshell` / `BarWidget`) and CLI (`omarchy-gemi
   - **Claude Code (`~/.claude/settings.json`)**: Toggles `ANTHROPIC_BASE_URL="http://127.0.0.1:4000"` + `ANTHROPIC_AUTH_TOKEN="adc-keyless"` and model tier mappings while preserving all existing hooks, themes, and backing up your prior `env` settings for lossless restore.
   - **OpenAI Codex (`~/.codex/config.toml`)**: Toggles `model_provider = "gemini_adc"` and `[model_providers.gemini_adc]` (`wire_api = "responses"`, `base_url = "http://127.0.0.1:4000/v1"`) while preserving all existing `[features]`, `[tui]`, and `[hooks]` sections.
   - **Route Both / Disable All**: 1-click master switch in the panel header.
-- **Live Model & Reasoning Effort Selector**:
-  - Switch between **Gemini 3.8 Flash** (`gemini-3.8-flash`) and **Gemini 4.0 Argon** (`gemini-4-argon`).
+- **Live Dynamic Model & Reasoning Effort Selector**:
+  - Switch between preset models (**Gemini 3.8 Flash**, **Gemini 4.0 Argon**) or enter any custom Vertex AI Gemini model ID (e.g., `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-3.1-pro-preview`) directly from the popup or CLI.
+  - Cycle through all configured `available_models` via middle-click or `set-model --flip`.
   - Adjust Gemini thinking level / reasoning effort (`LOW`, `MEDIUM`, `HIGH`, `XHIGH`).
 - **Router Daemon & ADC Health Monitor**:
   - Start, stop, or restart `claude-gemini-router.service` (`http://127.0.0.1:4000`).
@@ -33,9 +34,11 @@ omarchy-gemini-router-ctl enable --target both
 omarchy-gemini-router-ctl enable --target claude
 omarchy-gemini-router-ctl enable --target codex
 
-# Switch active Gemini model and reasoning effort
+# Switch active Gemini model (presets or any custom Vertex AI Gemini model) and reasoning effort
 omarchy-gemini-router-ctl set-model --model gemini-4-argon --effort high
 omarchy-gemini-router-ctl set-model --model gemini-3.8-flash --effort medium
+omarchy-gemini-router-ctl set-model --model gemini-2.5-pro
+omarchy-gemini-router-ctl set-model --flip
 
 # Disable routing and cleanly restore original ~/.claude/settings.json and ~/.codex/config.toml
 omarchy-gemini-router-ctl disable --target both

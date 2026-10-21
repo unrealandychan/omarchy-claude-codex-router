@@ -4,6 +4,7 @@ use std::sync::{LazyLock, Mutex};
 use java_like_uuid::new_short_id;
 
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-3.1-pro-preview";
+pub const DEFAULT_FAST_GEMINI_MODEL: &str = "gemini-3-flash-preview";
 pub const SKIP_THOUGHT_SIGNATURE_VALIDATOR: &str = "skip_thought_signature_validator";
 
 mod java_like_uuid {
@@ -71,42 +72,167 @@ impl ThoughtSignatureStore {
 pub static SIGNATURE_STORE: LazyLock<ThoughtSignatureStore> =
     LazyLock::new(|| ThoughtSignatureStore::new(2048));
 
+pub fn default_gemini_model() -> String {
+    std::env::var("GEMINI_DEFAULT_MODEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_GEMINI_MODEL.to_string())
+}
+
+pub fn default_fast_gemini_model() -> String {
+    std::env::var("GEMINI_FAST_MODEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_FAST_GEMINI_MODEL.to_string())
+}
+
 pub fn resolve_gemini_model(requested_model: Option<&str>) -> String {
-    let model = match requested_model {
+    let raw = match requested_model {
         Some(m) if !m.trim().is_empty() => m.trim(),
-        _ => return DEFAULT_GEMINI_MODEL.to_string(),
+        _ => return default_gemini_model(),
     };
+    // Strip optional Claude Code context window suffix like `[1m]`
+    let model = raw.split('[').next().unwrap_or(raw).trim();
+    if model.is_empty() {
+        return default_gemini_model();
+    }
     let lower = model.to_lowercase();
+
+    // 1. User-defined dynamic aliases via GEMINI_MODEL_ALIASES="alias1=target1,alias2=target2"
+    if let Ok(custom_aliases) = std::env::var("GEMINI_MODEL_ALIASES") {
+        for pair in custom_aliases.split(',') {
+            if let Some((alias, target)) = pair.split_once('=') {
+                let alias_clean = alias.trim().to_lowercase();
+                let target_clean = target.trim();
+                if !alias_clean.is_empty() && !target_clean.is_empty() && lower == alias_clean {
+                    return target_clean.to_string();
+                }
+            }
+        }
+    }
+
+    // 2. Built-in shorthand aliases
     for (alias, target) in [
         ("gemini-4-argon", "gemini-4-argon"),
+        ("gemini-4.0", "gemini-4-argon"),
+        ("gemini-4.0-pro", "gemini-4-argon"),
+        ("4.0", "gemini-4-argon"),
         ("argon", "gemini-4-argon"),
         ("gemini-3.8-flash", "gemini-3.8-flash"),
+        ("gemini-3.8", "gemini-3.8-flash"),
         ("3.8-flash", "gemini-3.8-flash"),
+        ("3.8", "gemini-3.8-flash"),
+        ("flash", "gemini-3.8-flash"),
         ("gemini-3.1-pro-preview", "gemini-3.1-pro-preview"),
         ("gemini-3.1-pro", "gemini-3.1-pro-preview"),
+        ("3.1-pro", "gemini-3.1-pro-preview"),
+        ("3.1", "gemini-3.1-pro-preview"),
         ("gemini-3-flash-preview", "gemini-3-flash-preview"),
         ("gemini-3-flash", "gemini-3-flash-preview"),
+        ("3-flash", "gemini-3-flash-preview"),
         ("gemini-2.5-pro", "gemini-2.5-pro"),
+        ("2.5-pro", "gemini-2.5-pro"),
         ("gemini-2.5-flash-lite", "gemini-2.5-flash-lite"),
+        ("2.5-flash-lite", "gemini-2.5-flash-lite"),
         ("gemini-2.5-flash", "gemini-2.5-flash"),
+        ("2.5-flash", "gemini-2.5-flash"),
     ] {
         if lower == alias {
             return target.to_string();
         }
     }
+
+    // 3. Any explicit Gemini model ID (past, present, or future) passes through directly
     if lower.starts_with("gemini-") {
         return model.to_string();
     }
+
+    // 4. Client tier mappings (Haiku/fast vs Sonnet/Opus/Codex/GPT)
     if lower.contains("haiku") || lower.contains("mini") || lower.contains("fast") {
-        return "gemini-3-flash-preview".to_string();
+        return default_fast_gemini_model();
     }
     if lower.contains("sonnet") || lower.contains("opus") || lower.contains("claude") {
-        return DEFAULT_GEMINI_MODEL.to_string();
+        return default_gemini_model();
     }
-    if lower.contains("codex") || lower.starts_with("gpt-") || lower.starts_with("o1") || lower.starts_with("o3") || lower.starts_with("o4") {
-        return DEFAULT_GEMINI_MODEL.to_string();
+    if lower.contains("codex")
+        || lower.starts_with("gpt-")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
+    {
+        return default_gemini_model();
     }
-    DEFAULT_GEMINI_MODEL.to_string()
+
+    // 5. If a custom non-Anthropic/non-OpenAI model ID was explicitly passed, preserve it
+    if lower.contains("gemini") {
+        return model.to_string();
+    }
+    default_gemini_model()
+}
+
+pub fn format_model_display_name(model: &str) -> String {
+    let clean = model.trim().to_lowercase();
+    match clean.as_str() {
+        "gemini-4-argon" => "Gemini 4.0 Argon".to_string(),
+        "gemini-3.8-flash" => "Gemini 3.8 Flash".to_string(),
+        _ => {
+            let mut parts: Vec<&str> = model.trim().split('-').collect();
+            if parts.len() > 2 && parts.last().map(|s| s.eq_ignore_ascii_case("preview")) == Some(true) {
+                parts.pop();
+            }
+            parts
+                .into_iter()
+                .map(|part| {
+                    let mut chars = part.chars();
+                    match chars.next() {
+                        None => String::new(),
+                        Some(first) => {
+                            first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                        }
+                    }
+                })
+                .collect::<Vec<String>>()
+                .join(" ")
+        }
+    }
+}
+
+pub fn format_model_short_label(model: &str) -> String {
+    let clean = model.trim().to_lowercase();
+    match clean.as_str() {
+        "gemini-4-argon" => "Gemini 4.0".to_string(),
+        "gemini-3.8-flash" => "Gemini 3.8".to_string(),
+        _ => format_model_display_name(model),
+    }
+}
+
+pub fn format_model_short_badge(model: &str) -> String {
+    let clean = model.trim().to_lowercase();
+    match clean.as_str() {
+        "gemini-4-argon" => "G4".to_string(),
+        "gemini-3.8-flash" => "G3.8".to_string(),
+        _ => {
+            let stripped = clean.strip_prefix("gemini-").unwrap_or(&clean);
+            let mut segs = stripped.split('-');
+            let first = segs.next().unwrap_or("?");
+            let second = segs.next().unwrap_or("");
+            let third = segs.next().unwrap_or("");
+            let suffix = if third == "lite" {
+                "L"
+            } else if second == "pro" {
+                "P"
+            } else if second == "flash" {
+                "F"
+            } else if second == "ultra" {
+                "U"
+            } else {
+                ""
+            };
+            format!("G{}{}", first.to_uppercase(), suffix)
+        }
+    }
 }
 
 fn resolve_json_ref(ref_path: &str, root_schema: &Map<String, Value>) -> Option<Map<String, Value>> {
