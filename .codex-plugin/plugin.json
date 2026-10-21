@@ -1,0 +1,40 @@
+{
+  "name": "gemini-adc-router",
+  "version": "0.2.0",
+  "description": "Keyless (ADC-only) Vertex AI Gemini 3.8 & Gemini 4.0 router and plugin for OpenAI Codex and Claude Code",
+  "author": {
+    "name": "Eddie Chan",
+    "email": "admin@eddieckc.altostrat.com",
+    "url": "https://github.com/eddieckc/claude-gemini-adc-router"
+  },
+  "repository": "https://github.com/eddieckc/claude-gemini-adc-router",
+  "license": "MIT",
+  "keywords": [
+    "gemini",
+    "vertex-ai",
+    "adc",
+    "router",
+    "codex",
+    "claude-code",
+    "omarchy"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Gemini ADC Router",
+    "shortDescription": "Route Codex & Claude Code to Vertex AI Gemini 3.8 / 4.0 via ADC",
+    "longDescription": "Keyless (Application Default Credentials only, zero API keys) local router and plugin that translates OpenAI Codex Responses API (/v1/responses) and Anthropic Messages API (/v1/messages) to Google Cloud Vertex AI Gemini 3.8 Flash and Gemini 4.0 Argon.",
+    "developerName": "Eddie Chan",
+    "category": "Infrastructure",
+    "capabilities": [
+      "Skills",
+      "Model Routing",
+      "Vertex AI ADC"
+    ],
+    "defaultPrompt": [
+      "Check the Gemini ADC router health and active model",
+      "Switch the Gemini ADC router primary model to gemini-4-argon",
+      "Show the Omarchy Gemini Router plugin status"
+    ],
+    "brandColor": "#4285F4"
+  }
+}

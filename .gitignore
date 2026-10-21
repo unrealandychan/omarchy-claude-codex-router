@@ -1,0 +1,31 @@
+# Python virtual environments & caches
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Logs & runtime state
+*.log
+state.json
+router.env
+
+# OS / Editor files
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+.claude/

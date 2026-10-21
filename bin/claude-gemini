@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Keyless (ADC-only) launcher for Claude Code routed to Gemini 3.8 & Gemini 4.0
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ROUTER_PORT="${ROUTER_PORT:-4000}"
+ROUTER_URL="http://127.0.0.1:${ROUTER_PORT}"
+
+PRIMARY_MODEL="${GEMINI_PRIMARY_MODEL:-gemini-3.8-flash}"
+PRINT_ENV_ONLY=false
+START_ONLY=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --3.8|--flash)
+      PRIMARY_MODEL="gemini-3.8-flash"
+      shift
+      ;;
+    --4.0|--argon|--pro)
+      PRIMARY_MODEL="gemini-4-argon"
+      shift
+      ;;
+    --model=*)
+      PRIMARY_MODEL="${1#*=}"
+      shift
+      ;;
+    --env)
+      PRINT_ENV_ONLY=true
+      shift
+      ;;
+    --serve)
+      START_ONLY=true
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ "${PRINT_ENV_ONLY}" == "true" ]]; then
+  cat <<EOF
+unset ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_USE_VERTEX
+export ANTHROPIC_BASE_URL="${ROUTER_URL}"
+export ANTHROPIC_AUTH_TOKEN="adc-keyless"
+export ANTHROPIC_MODEL="${PRIMARY_MODEL}"
+export ANTHROPIC_SMALL_FAST_MODEL="claude-haiku-4-5"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-4-5"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${PRIMARY_MODEL}"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${PRIMARY_MODEL}"
+export DISABLE_PROMPT_CACHING=1
+EOF
+  exit 0
+fi
+
+export PATH="${HOME}/.local/share/mise/shims:${HOME}/.local/bin:${HOME}/google-cloud-sdk/bin:${PATH}"
+
+if [[ "${START_ONLY}" == "true" ]]; then
+  cd "${PROJECT_DIR}"
+  exec uv run claude-gemini-router --port "${ROUTER_PORT}" "$@"
+fi
+
+# Ensure router is running in the background
+export NO_PROXY="127.0.0.1,localhost,${NO_PROXY:-}"
+export no_proxy="127.0.0.1,localhost,${no_proxy:-}"
+if ! curl --noproxy '*' -fsS "${ROUTER_URL}/health" >/dev/null 2>&1; then
+  echo "[claude-gemini] Starting ADC router on ${ROUTER_URL}..." >&2
+  (
+    cd "${PROJECT_DIR}"
+    nohup uv run claude-gemini-router --port "${ROUTER_PORT}" \
+      >/tmp/claude-gemini-router.log 2>&1 &
+  )
+  for _ in {1..30}; do
+    if curl --noproxy '*' -fsS "${ROUTER_URL}/health" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.2
+  done
+fi
+
+unset ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY
+export CLAUDE_CODE_USE_VERTEX=0
+export ANTHROPIC_BASE_URL="${ROUTER_URL}"
+export ANTHROPIC_AUTH_TOKEN="adc-keyless"
+export ANTHROPIC_MODEL="${PRIMARY_MODEL}[1m]"
+export ANTHROPIC_SMALL_FAST_MODEL="claude-haiku-4-5"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-4-5"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${PRIMARY_MODEL}[1m]"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${PRIMARY_MODEL}[1m]"
+export DISABLE_PROMPT_CACHING=1
+
+SETTINGS_OVERRIDE="{\"env\":{\"CLAUDE_CODE_USE_VERTEX\":\"0\",\"ANTHROPIC_BASE_URL\":\"${ROUTER_URL}\",\"ANTHROPIC_AUTH_TOKEN\":\"adc-keyless\",\"ANTHROPIC_MODEL\":\"${PRIMARY_MODEL}[1m]\",\"ANTHROPIC_SMALL_FAST_MODEL\":\"claude-haiku-4-5\",\"ANTHROPIC_DEFAULT_HAIKU_MODEL\":\"claude-haiku-4-5\",\"ANTHROPIC_DEFAULT_SONNET_MODEL\":\"${PRIMARY_MODEL}[1m]\",\"ANTHROPIC_DEFAULT_OPUS_MODEL\":\"${PRIMARY_MODEL}[1m]\",\"DISABLE_PROMPT_CACHING\":\"1\"}}"
+
+if command -v claude >/dev/null 2>&1; then
+  exec claude --settings "${SETTINGS_OVERRIDE}" "$@"
+else
+  echo "[claude-gemini] Router is live at ${ROUTER_URL} (model=${PRIMARY_MODEL})." >&2
+  echo "[claude-gemini] 'claude' CLI not found on PATH. Run: eval \"\$(${SCRIPT_DIR}/claude-gemini --env)\"" >&2
+fi

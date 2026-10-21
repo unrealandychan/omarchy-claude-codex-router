@@ -1,0 +1,16 @@
+{
+  "name": "gemini-adc-router-marketplace",
+  "description": "Keyless (ADC-only) Vertex AI Gemini 3.8 & Gemini 4.0 router and plugin marketplace for Claude Code and OpenAI Codex",
+  "owner": {
+    "name": "Eddie Chan",
+    "email": "admin@eddieckc.altostrat.com"
+  },
+  "plugins": [
+    {
+      "name": "gemini-adc-router",
+      "source": "./",
+      "description": "Keyless (ADC-only) Vertex AI Gemini 3.8 & Gemini 4.0 router and plugin for Claude Code and OpenAI Codex",
+      "version": "0.2.0"
+    }
+  ]
+}

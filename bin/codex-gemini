@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Keyless (ADC-only) launcher for OpenAI Codex CLI routed to Gemini 3.8 & Gemini 4.0
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ROUTER_PORT="${ROUTER_PORT:-4000}"
+ROUTER_URL="http://127.0.0.1:${ROUTER_PORT}"
+
+PRIMARY_MODEL="${GEMINI_PRIMARY_MODEL:-gemini-3.8-flash}"
+REASONING_EFFORT="${GEMINI_REASONING_EFFORT:-medium}"
+PRINT_ENV_ONLY=false
+PRINT_TOML_ONLY=false
+START_ONLY=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --3.8|--flash)
+      PRIMARY_MODEL="gemini-3.8-flash"
+      shift
+      ;;
+    --4.0|--argon|--pro)
+      PRIMARY_MODEL="gemini-4-argon"
+      shift
+      ;;
+    --model=*)
+      PRIMARY_MODEL="${1#*=}"
+      shift
+      ;;
+    --effort=*)
+      REASONING_EFFORT="${1#*=}"
+      shift
+      ;;
+    --env)
+      PRINT_ENV_ONLY=true
+      shift
+      ;;
+    --config-toml)
+      PRINT_TOML_ONLY=true
+      shift
+      ;;
+    --serve)
+      START_ONLY=true
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ "${PRINT_ENV_ONLY}" == "true" ]]; then
+  cat <<EOF
+unset OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY
+export OPENAI_BASE_URL="${ROUTER_URL}/v1"
+export GEMINI_PRIMARY_MODEL="${PRIMARY_MODEL}"
+export GEMINI_REASONING_EFFORT="${REASONING_EFFORT}"
+EOF
+  exit 0
+fi
+
+if [[ "${PRINT_TOML_ONLY}" == "true" ]]; then
+  cat <<EOF
+model_provider = "gemini_adc"
+model = "${PRIMARY_MODEL}"
+model_reasoning_effort = "${REASONING_EFFORT}"
+
+[model_providers.gemini_adc]
+name = "Gemini ADC Router (Vertex AI)"
+base_url = "${ROUTER_URL}/v1"
+wire_api = "responses"
+EOF
+  exit 0
+fi
+
+export PATH="${HOME}/.local/share/mise/shims:${HOME}/.local/bin:${HOME}/google-cloud-sdk/bin:${PATH}"
+
+if [[ "${START_ONLY}" == "true" ]]; then
+  cd "${PROJECT_DIR}"
+  exec uv run claude-gemini-router --port "${ROUTER_PORT}" "$@"
+fi
+
+# Ensure router is running in the background
+export NO_PROXY="127.0.0.1,localhost,${NO_PROXY:-}"
+export no_proxy="127.0.0.1,localhost,${no_proxy:-}"
+if ! curl --noproxy '*' -fsS "${ROUTER_URL}/health" >/dev/null 2>&1; then
+  echo "[codex-gemini] Starting ADC router on ${ROUTER_URL}..." >&2
+  (
+    cd "${PROJECT_DIR}"
+    nohup uv run claude-gemini-router --port "${ROUTER_PORT}" \
+      >/tmp/claude-gemini-router.log 2>&1 &
+  )
+  for _ in {1..30}; do
+    if curl --noproxy '*' -fsS "${ROUTER_URL}/health" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.2
+  done
+fi
+
+unset OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY
+
+if command -v codex >/dev/null 2>&1; then
+  exec codex \
+    -c 'model_provider="gemini_adc"' \
+    -c "model=\"${PRIMARY_MODEL}\"" \
+    -c "model_reasoning_effort=\"${REASONING_EFFORT}\"" \
+    -c 'model_providers.gemini_adc.name="Gemini ADC Router (Vertex AI)"' \
+    -c "model_providers.gemini_adc.base_url=\"${ROUTER_URL}/v1\"" \
+    -c 'model_providers.gemini_adc.wire_api="responses"' \
+    "$@"
+else
+  echo "[codex-gemini] Router is live at ${ROUTER_URL}/v1 (model=${PRIMARY_MODEL})." >&2
+  echo "[codex-gemini] 'codex' CLI not found on PATH." >&2
+fi

@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "arch.gemini-router",
+  "name": "Gemini ADC Router",
+  "version": "0.2.0",
+  "author": "Eddie Chan",
+  "license": "MIT",
+  "description": "Route Claude Code and OpenAI Codex to Vertex AI Gemini 3.8 & 4.0 via Application Default Credentials (ADC) with zero API keys.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "plugin/GeminiRouter.qml"
+  },
+  "barWidget": {
+    "displayName": "Gemini ADC Router",
+    "description": "Toggle Claude Code & Codex routing to Vertex AI Gemini 3.8 / 4.0 via ADC",
+    "category": "System",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}
