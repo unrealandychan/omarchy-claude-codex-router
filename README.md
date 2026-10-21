@@ -10,6 +10,7 @@ A high-performance, zero-dependency-drift **Rust** proxy server (`claude-gemini-
 - [Key Features & Handled Gotchas](#key-features--handled-gotchas)
 - [Function Calling, Skills & Tool Search Support](#function-calling-skills--tool-search-support)
 - [Model Tier & Reasoning Effort Routing](#model-tier--reasoning-effort-routing)
+- [Dynamic Model Configuration Tutorial](#dynamic-model-configuration-tutorial)
 - [Supported HTTP Endpoints](#supported-http-endpoints)
 - [Installation & Quick Start](#installation--quick-start)
   - [1. Full Installation (Daemon + CLI + Omarchy Bar Plugin)](#1-full-installation-daemon--cli--omarchy-bar-plugin)
@@ -98,9 +99,11 @@ Vertex AI's `functionDeclarations` and Gemini 3.x / 4.0 `thoughtSignature` valid
 
 | Client Model / Alias | Target Vertex AI Model | Fallback Behavior |
 | :--- | :--- | :--- |
-| `gemini-3.8`, `gemini-3.8-flash`, `claude-*-haiku*`, `claude-*-sonnet*`, `gpt-5-codex`, `gpt-5`, `o4-mini` | `gemini-3.8-flash` (or active `GEMINI_PRIMARY_MODEL`) | Falls back to `gemini-3-flash-preview` if unavailable |
-| `gemini-4.0`, `gemini-4.0-pro`, `gemini-4-argon`, `claude-*-opus*`, `gpt-5-pro`, `o3-pro` | `gemini-4-argon` | Automatically falls back to `gemini-3.8-flash` on `404`/`403`/`400` if the GCP project is not allowlisted for `gemini-4-argon` |
-| `gemini-3.1-pro-preview`, `gemini-2.5-pro`, `gemini-2.5-flash` | Passed through directly to Vertex AI | — |
+| `gemini-3.8`, `gemini-3.8-flash`, `claude-*-sonnet*`, `claude-*-opus*`, `gpt-5-codex`, `gpt-5`, `o3-pro` | `gemini-3.8-flash` (or active `GEMINI_PRIMARY_MODEL`) | Falls back to `GEMINI_FALLBACK_MODEL` or `gemini-3-flash-preview` if unavailable |
+| `claude-*-haiku*`, `o4-mini`, `*-mini`, `*-fast` | `gemini-3-flash-preview` (or active `GEMINI_FAST_MODEL`) | Falls back to `GEMINI_FALLBACK_MODEL` if unavailable |
+| `gemini-4.0`, `gemini-4.0-pro`, `gemini-4-argon`, `argon` | `gemini-4-argon` | Automatically falls back to `GEMINI_FALLBACK_MODEL` (default `gemini-3.8-flash`) on `404`/`403`/`400` |
+| **Any `gemini-*` model ID** (`gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-3.1-pro-preview`, `gemini-5.0-*`, etc.) | Passed through directly to Vertex AI | Falls back to `GEMINI_FALLBACK_MODEL` (or `gemini-3.8-flash`) on `404`/`403`/`400` |
+| **Custom Aliases (`GEMINI_MODEL_ALIASES`)** | User-defined mapping (`alias=target`) | Resolved before built-in aliases |
 
 ### Reasoning Effort (`thinkingConfig.thinkingLevel`)
 
@@ -108,6 +111,95 @@ Vertex AI's `functionDeclarations` and Gemini 3.x / 4.0 `thoughtSignature` valid
   - `low` $\rightarrow$ `thinkingLevel: "LOW"`
   - `medium` $\rightarrow$ `thinkingLevel: "MEDIUM"`
   - `high` / `xhigh` $\rightarrow$ `thinkingLevel: "HIGH"`
+
+---
+
+## Dynamic Model Configuration Tutorial
+
+Models are **not** hardcoded to only `gemini-3.8-flash` and `gemini-4-argon`. You can dynamically configure any Vertex AI Gemini model ID, customize the bar widget presets, set separate fast/Haiku and fallback models, or define your own model aliases using any of the 5 methods below:
+
+### Method 1: Omarchy Status Bar Popup (`GeminiRouter.qml`)
+1. **Left-click** the `󰚩` Gemini Router widget in your Omarchy bar to open the control panel.
+2. Under **Active Vertex AI Gemini Model**:
+   - Click any **preset button** (dynamically rendered from your `available_models` list).
+   - Or type **any Vertex AI Gemini model ID** (for example `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-3.1-pro-preview`) into the **Custom model ID** input box and click **Use Model** (or press `Enter`).
+   - Any custom model you activate is automatically added to your preset buttons and persisted in `~/.config/omarchy/gemini-router/state.json`.
+3. **Middle-click** the bar widget at any time to cycle through all models in your `available_models` list (`--flip`).
+
+### Method 2: Plugin Control CLI (`omarchy-gemini-router-ctl`)
+`omarchy-gemini-router-ctl` updates the live router daemon (`/config`), `~/.claude/settings.json`, `~/.codex/config.toml`, `~/.config/omarchy/gemini-router/state.json`, and `~/.config/omarchy/gemini-router/router.env` in one atomic operation:
+
+```bash
+# 1. Switch active primary model to any Vertex AI Gemini model (or shorthand alias)
+omarchy-gemini-router-ctl set-model --model gemini-2.5-pro
+omarchy-gemini-router-ctl set-model --model gemini-3.1-pro-preview --effort high
+
+# 2. Cycle to the next model in your available_models list
+omarchy-gemini-router-ctl set-model --flip
+
+# 3. Add or remove model presets from the bar widget & --flip rotation
+omarchy-gemini-router-ctl set-model --add-model gemini-2.5-pro
+omarchy-gemini-router-ctl set-model --add-model gemini-2.5-flash
+omarchy-gemini-router-ctl set-model --remove-model gemini-2.5-flash
+
+# 4. Replace the entire preset list at once (comma-separated)
+omarchy-gemini-router-ctl set-model --models "gemini-3.8-flash,gemini-4-argon,gemini-2.5-pro,gemini-3.1-pro-preview"
+
+# 5. Configure a custom fast/Haiku tier model or 404/429 fallback model (use "default" to reset)
+omarchy-gemini-router-ctl set-model --fast-model gemini-2.5-flash --fallback-model gemini-3.8-flash
+```
+
+### Method 3: Persistent Environment File (`~/.config/omarchy/gemini-router/router.env`)
+The `claude-gemini-router.service` systemd unit and the `claude-gemini` / `codex-gemini` launchers automatically source `~/.config/omarchy/gemini-router/router.env`:
+
+```ini
+GEMINI_PRIMARY_MODEL=gemini-2.5-pro
+GEMINI_REASONING_EFFORT=high
+GEMINI_AVAILABLE_MODELS=gemini-3.8-flash,gemini-4-argon,gemini-2.5-pro,gemini-3.1-pro-preview
+
+# Optional: override the model used for Claude Haiku / fast background subagents
+GEMINI_FAST_MODEL=gemini-2.5-flash
+
+# Optional: override the fallback model when the primary model returns 404/403/400
+GEMINI_FALLBACK_MODEL=gemini-3.8-flash
+
+# Optional: define custom model aliases (comma-separated alias=target pairs)
+GEMINI_MODEL_ALIASES=my-pro=gemini-2.5-pro,my-fast=gemini-2.5-flash,next=gemini-5.0-ultra
+
+ROUTER_PORT=4000
+```
+
+After editing `router.env`, apply it with:
+```bash
+omarchy-gemini-router-ctl restart-router
+```
+
+### Method 4: Live HTTP Hot-Swap API (`POST /config`)
+Hot-swap models on the running router daemon without restarting Claude Code or OpenAI Codex:
+
+```bash
+curl -fsS -X POST http://127.0.0.1:4000/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "primary_model": "gemini-2.5-pro",
+    "fast_model": "gemini-2.5-flash",
+    "fallback_model": "gemini-3.8-flash",
+    "available_models": ["gemini-3.8-flash", "gemini-4-argon", "gemini-2.5-pro"],
+    "reasoning_effort": "high",
+    "hot_swap": true
+  }'
+```
+
+### Method 5: Per-Session Wrapper Flags (`claude-gemini` & `codex-gemini`)
+Launch a single terminal session with any custom model without altering global settings:
+
+```bash
+claude-gemini --model gemini-2.5-pro
+claude-gemini --model=gemini-3.1-pro-preview
+
+codex-gemini --model gemini-2.5-pro --effort high
+codex-gemini --model=gemini-3.1-pro-preview --effort=xhigh
+```
 
 ---
 
@@ -226,7 +318,12 @@ claude-gemini-router [--host 127.0.0.1] [--port 4000] [--project GCP_PROJECT_ID]
 | `ROUTER_PORT` | `4000` | Listen port for the HTTP server |
 | `GOOGLE_CLOUD_PROJECT` | Auto-detected from ADC / `gcloud` | Google Cloud Project ID used for Vertex AI requests |
 | `GOOGLE_CLOUD_LOCATION` | `global` | Vertex AI region (`global`, `us-central1`, etc.) |
-| `GEMINI_PRIMARY_MODEL` | `gemini-3.8-flash` | Default target model (`gemini-3.8-flash` or `gemini-4-argon`) |
+| `GEMINI_PRIMARY_MODEL` | `gemini-3.8-flash` | Default primary Vertex AI Gemini model (any `gemini-*` model ID) |
+| `GEMINI_DEFAULT_MODEL` | `gemini-3.1-pro-preview` | Fallback default model when `GEMINI_PRIMARY_MODEL` is not set |
+| `GEMINI_FAST_MODEL` | `gemini-3-flash-preview` | Target model for Claude Haiku / fast background subagent requests |
+| `GEMINI_FALLBACK_MODEL` | `gemini-3.8-flash` | Target fallback model when the primary model returns `404`/`403`/`400` |
+| `GEMINI_AVAILABLE_MODELS` | `gemini-3.8-flash,gemini-4-argon` | Comma-separated list of preset models exposed in `/v1/models`, `--flip`, and the bar widget |
+| `GEMINI_MODEL_ALIASES` | *(empty)* | Comma-separated `alias=target` pairs (e.g. `next=gemini-5.0-ultra,fast=gemini-2.5-flash`) |
 | `GEMINI_REASONING_EFFORT` | `medium` | Default thinking effort (`low`, `medium`, `high`, `xhigh`) |
 | `GEMINI_HOT_SWAP_ALL` | `0` | When `1` or enabled via `/config`, overrides explicit client model tiers with `GEMINI_PRIMARY_MODEL` |
 

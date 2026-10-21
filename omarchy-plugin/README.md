@@ -40,6 +40,14 @@ omarchy-gemini-router-ctl set-model --model gemini-3.8-flash --effort medium
 omarchy-gemini-router-ctl set-model --model gemini-2.5-pro
 omarchy-gemini-router-ctl set-model --flip
 
+# Add, remove, or replace model presets shown in the bar widget & --flip rotation
+omarchy-gemini-router-ctl set-model --add-model gemini-2.5-pro
+omarchy-gemini-router-ctl set-model --remove-model gemini-2.5-pro
+omarchy-gemini-router-ctl set-model --models "gemini-3.8-flash,gemini-4-argon,gemini-2.5-pro"
+
+# Override the fast (Haiku) tier model or fallback model
+omarchy-gemini-router-ctl set-model --fast-model gemini-2.5-flash --fallback-model gemini-3.8-flash
+
 # Disable routing and cleanly restore original ~/.claude/settings.json and ~/.codex/config.toml
 omarchy-gemini-router-ctl disable --target both
 
