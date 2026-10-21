@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CTL="${PLUGIN_DIR}/bin/omarchy-gemini-router-ctl"
+CTL="${CTL_BIN:-${PLUGIN_DIR}/bin/omarchy-gemini-router-ctl}"
 
 TMP_ROOT="$(mktemp -d /tmp/omarchy-gemini-router-test.XXXXXX)"
 trap 'rm -rf "${TMP_ROOT}"' EXIT
@@ -89,14 +89,14 @@ EOF
 chmod 600 "${CODEX_CONFIG_PATH}"
 
 echo "==> 2. Verify initial status (routing off)"
-STATUS_JSON="$(python3 "${CTL}" status)"
+STATUS_JSON="$("${CTL}" status)"
 assert_eq "$(json_field "${STATUS_JSON}" "data['ok']")" "True" "Initial status ok=True"
 assert_eq "$(json_field "${STATUS_JSON}" "data['claude_enabled']")" "False" "Claude initially disabled"
 assert_eq "$(json_field "${STATUS_JSON}" "data['codex_enabled']")" "False" "Codex initially disabled"
 assert_eq "$(json_field "${STATUS_JSON}" "data['badge_text']")" "ADC Off" "Badge text is ADC Off"
 
 echo "==> 3. Enable Claude routing only"
-RES_CLAUDE="$(python3 "${CTL}" enable --target claude)"
+RES_CLAUDE="$("${CTL}" enable --target claude)"
 assert_eq "$(json_field "${RES_CLAUDE}" "data['claude_enabled']")" "True" "Claude routing enabled"
 assert_eq "$(json_field "${RES_CLAUDE}" "data['codex_enabled']")" "False" "Codex routing still disabled"
 assert_eq "$(json_field "${RES_CLAUDE}" "data['badge_text']")" "Claude -> G3.8" "Badge shows Claude -> G3.8"
@@ -112,7 +112,7 @@ assert_eq "$(json_field "${CLAUDE_FILE_CONTENT}" "data['theme']")" "custom:omarc
 assert_eq "$(json_field "${CLAUDE_FILE_CONTENT}" "'Stop' in data['hooks']")" "True" "Claude hooks preserved"
 
 echo "==> 4. Enable Codex routing"
-RES_CODEX="$(python3 "${CTL}" enable --target codex)"
+RES_CODEX="$("${CTL}" enable --target codex)"
 assert_eq "$(json_field "${RES_CODEX}" "data['claude_enabled']")" "True" "Claude remains enabled"
 assert_eq "$(json_field "${RES_CODEX}" "data['codex_enabled']")" "True" "Codex routing enabled"
 assert_eq "$(json_field "${RES_CODEX}" "data['both_enabled']")" "True" "both_enabled is True"
@@ -126,7 +126,7 @@ assert_contains "${CODEX_FILE_CONTENT}" 'screen_reader_detection_done = true' "C
 assert_contains "${CODEX_FILE_CONTENT}" 'hooks = true' "Codex [features] preserved"
 
 echo "==> 5. Switch model to gemini-4-argon and effort to high"
-RES_MODEL="$(python3 "${CTL}" set-model --model gemini-4-argon --effort high)"
+RES_MODEL="$("${CTL}" set-model --model gemini-4-argon --effort high)"
 assert_eq "$(json_field "${RES_MODEL}" "data['primary_model']")" "gemini-4-argon" "Model updated to gemini-4-argon"
 assert_eq "$(json_field "${RES_MODEL}" "data['reasoning_effort']")" "high" "Effort updated to high"
 assert_eq "$(json_field "${RES_MODEL}" "data['badge_text']")" "C+X -> G4" "Badge updated to C+X -> G4"
@@ -139,12 +139,12 @@ CODEX_FILE_CONTENT="$(cat "${CODEX_CONFIG_PATH}")"
 assert_contains "${CODEX_FILE_CONTENT}" 'model = "gemini-4-argon"' "Codex model updated to gemini-4-argon"
 assert_contains "${CODEX_FILE_CONTENT}" 'model_reasoning_effort = "high"' "Codex effort updated to high"
 
-RES_FLIP="$(python3 "${CTL}" set-model --flip)"
+RES_FLIP="$("${CTL}" set-model --flip)"
 assert_eq "$(json_field "${RES_FLIP}" "data['primary_model']")" "gemini-3.8-flash" "set-model --flip flips gemini-4-argon -> gemini-3.8-flash"
 assert_eq "$(json_field "${RES_FLIP}" "'total_requests' in data['stats']")" "True" "status includes stats.total_requests"
 
 echo "==> 6. Disable both and verify lossless restoration of pre-existing configs"
-RES_DISABLE="$(python3 "${CTL}" disable --target both)"
+RES_DISABLE="$("${CTL}" disable --target both)"
 assert_eq "$(json_field "${RES_DISABLE}" "data['claude_enabled']")" "False" "Claude disabled"
 assert_eq "$(json_field "${RES_DISABLE}" "data['codex_enabled']")" "False" "Codex disabled"
 assert_eq "$(json_field "${RES_DISABLE}" "data['any_enabled']")" "False" "any_enabled is False"
@@ -167,30 +167,30 @@ else
 fi
 
 echo "==> 7. Test toggle & daemon subcommands"
-RES_TOGGLE_ON="$(python3 "${CTL}" toggle --target both)"
+RES_TOGGLE_ON="$("${CTL}" toggle --target both)"
 assert_eq "$(json_field "${RES_TOGGLE_ON}" "data['both_enabled']")" "True" "Toggle both -> ON"
-RES_TOGGLE_OFF="$(python3 "${CTL}" toggle --target both)"
+RES_TOGGLE_OFF="$("${CTL}" toggle --target both)"
 assert_eq "$(json_field "${RES_TOGGLE_OFF}" "data['any_enabled']")" "False" "Toggle both -> OFF"
 
-RES_STOP="$(python3 "${CTL}" stop-router)"
+RES_STOP="$("${CTL}" stop-router)"
 assert_eq "$(json_field "${RES_STOP}" "data['router_running']")" "False" "stop-router sets router_running=False"
-RES_START="$(python3 "${CTL}" start-router)"
+RES_START="$("${CTL}" start-router)"
 assert_eq "$(json_field "${RES_START}" "data['router_running']")" "True" "start-router sets router_running=True"
 
 echo "==> 8. Security & adversarial tests (Omaplug baseline)"
-BAD_TARGET="$(python3 "${CTL}" enable --target '; rm -rf /')"
+BAD_TARGET="$("${CTL}" enable --target '; rm -rf /')"
 assert_eq "$(json_field "${BAD_TARGET}" "data['ok']")" "False" "Rejects shell-injection target"
 
-BAD_MODEL="$(python3 "${CTL}" set-model --model '../../etc/passwd')"
+BAD_MODEL="$("${CTL}" set-model --model '../../etc/passwd')"
 assert_eq "$(json_field "${BAD_MODEL}" "data['ok']")" "False" "Rejects path-traversal model"
 
-BAD_EFFORT="$(python3 "${CTL}" set-model --effort 'ultra_invalid')"
+BAD_EFFORT="$("${CTL}" set-model --effort 'ultra_invalid')"
 assert_eq "$(json_field "${BAD_EFFORT}" "data['ok']")" "False" "Rejects invalid effort"
 
 # Symlink attack test on CLAUDE_SETTINGS_PATH
 mv "${CLAUDE_SETTINGS_PATH}" "${CLAUDE_SETTINGS_PATH}.real"
 ln -s "${CLAUDE_SETTINGS_PATH}.real" "${CLAUDE_SETTINGS_PATH}"
-SYMLINK_RES="$(python3 "${CTL}" enable --target claude)"
+SYMLINK_RES="$("${CTL}" enable --target claude)"
 assert_eq "$(json_field "${SYMLINK_RES}" "data['ok']")" "False" "Refuses to read/write symlinked config (O_NOFOLLOW)"
 rm -f "${CLAUDE_SETTINGS_PATH}"
 mv "${CLAUDE_SETTINGS_PATH}.real" "${CLAUDE_SETTINGS_PATH}"

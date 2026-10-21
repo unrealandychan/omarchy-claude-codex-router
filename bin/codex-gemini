@@ -73,21 +73,35 @@ EOF
   exit 0
 fi
 
-export PATH="${HOME}/.local/share/mise/shims:${HOME}/.local/bin:${HOME}/google-cloud-sdk/bin:${PATH}"
+export PATH="${HOME}/.cargo/bin:${HOME}/.local/share/mise/shims:${HOME}/.local/bin:${HOME}/google-cloud-sdk/bin:${PATH}"
+
+resolve_router_bin() {
+  if [[ -x "${PROJECT_DIR}/target/release/claude-gemini-router" ]]; then
+    echo "${PROJECT_DIR}/target/release/claude-gemini-router"
+  elif command -v claude-gemini-router >/dev/null 2>&1; then
+    command -v claude-gemini-router
+  elif [[ -x "${HOME}/.local/bin/claude-gemini-router" ]]; then
+    echo "${HOME}/.local/bin/claude-gemini-router"
+  else
+    (cd "${PROJECT_DIR}" && cargo build --release --locked >&2)
+    echo "${PROJECT_DIR}/target/release/claude-gemini-router"
+  fi
+}
 
 if [[ "${START_ONLY}" == "true" ]]; then
-  cd "${PROJECT_DIR}"
-  exec uv run claude-gemini-router --port "${ROUTER_PORT}" "$@"
+  ROUTER_BIN="$(resolve_router_bin)"
+  exec "${ROUTER_BIN}" --port "${ROUTER_PORT}" "$@"
 fi
 
 # Ensure router is running in the background
 export NO_PROXY="127.0.0.1,localhost,${NO_PROXY:-}"
 export no_proxy="127.0.0.1,localhost,${no_proxy:-}"
 if ! curl --noproxy '*' -fsS "${ROUTER_URL}/health" >/dev/null 2>&1; then
-  echo "[codex-gemini] Starting ADC router on ${ROUTER_URL}..." >&2
+  echo "[codex-gemini] Starting Rust ADC router on ${ROUTER_URL}..." >&2
+  ROUTER_BIN="$(resolve_router_bin)"
   (
     cd "${PROJECT_DIR}"
-    nohup uv run claude-gemini-router --port "${ROUTER_PORT}" \
+    nohup "${ROUTER_BIN}" --port "${ROUTER_PORT}" \
       >/tmp/claude-gemini-router.log 2>&1 &
   )
   for _ in {1..30}; do

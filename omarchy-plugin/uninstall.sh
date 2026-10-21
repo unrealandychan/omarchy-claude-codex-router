@@ -42,7 +42,7 @@ PY
 fi
 
 rm -rf "${PLUGIN_DEST}"
-rm -f "${BIN_DIR}/omarchy-gemini-router-ctl"
+rm -f "${BIN_DIR}/omarchy-gemini-router-ctl" "${BIN_DIR}/claude-gemini-router"
 
 if command -v omarchy-shell >/dev/null 2>&1; then
   omarchy-shell shell reloadConfig >/dev/null 2>&1 || true

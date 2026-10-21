@@ -12,12 +12,25 @@ BIN_DIR="${HOME}/.local/bin"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 SHELL_SETTINGS="${HOME}/.config/omarchy/shell.json"
 
-echo "==> Installing Omarchy plugin: ${PLUGIN_ID}"
+echo "==> Installing Omarchy plugin: ${PLUGIN_ID} (Rust edition)"
 
-chmod +x "${SCRIPT_DIR}/install.sh" "${SCRIPT_DIR}/uninstall.sh" "${SCRIPT_DIR}/tests/test-ctl.sh" "${SCRIPT_DIR}/bin/omarchy-gemini-router-ctl" 2>/dev/null || true
+chmod +x "${SCRIPT_DIR}/install.sh" "${SCRIPT_DIR}/uninstall.sh" "${SCRIPT_DIR}/tests/test-ctl.sh" 2>/dev/null || true
 
 mkdir -p "${PLUGIN_DEST}/plugin" "${PLUGIN_DEST}/bin"
 mkdir -p "${CONFIG_DIR}" "${BIN_DIR}" "${SYSTEMD_USER_DIR}"
+
+# Build or locate Rust release binaries
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${PROJECT_DIR}/target}"
+if command -v cargo >/dev/null 2>&1; then
+  echo "==> Building Rust release binaries in ${PROJECT_DIR}..."
+  (cd "${PROJECT_DIR}" && cargo build --release --locked --offline --target-dir "${CARGO_TARGET_DIR}")
+fi
+
+cp -f "${CARGO_TARGET_DIR}/release/claude-gemini-router" "${BIN_DIR}/claude-gemini-router"
+chmod 755 "${BIN_DIR}/claude-gemini-router"
+
+cp -f "${CARGO_TARGET_DIR}/release/omarchy-gemini-router-ctl" "${SCRIPT_DIR}/bin/omarchy-gemini-router-ctl"
+chmod 700 "${SCRIPT_DIR}/bin/omarchy-gemini-router-ctl"
 
 cp -f "${SCRIPT_DIR}/manifest.json" "${PLUGIN_DEST}/manifest.json"
 cp -f "${SCRIPT_DIR}/plugin/GeminiRouter.qml" "${PLUGIN_DEST}/plugin/GeminiRouter.qml"
@@ -46,17 +59,17 @@ EOF
   chmod 600 "${CONFIG_DIR}/router.env"
 fi
 
-# Install systemd user unit for the local ADC router daemon
+# Install systemd user unit for the local Rust ADC router daemon
 cat > "${SYSTEMD_USER_DIR}/claude-gemini-router.service" <<EOF
 [Unit]
-Description=Claude Code & OpenAI Codex -> Vertex AI Gemini ADC Router
+Description=Claude Code & OpenAI Codex -> Vertex AI Gemini ADC Router (Rust)
 After=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=${PROJECT_DIR}
 EnvironmentFile=-%h/.config/omarchy/gemini-router/router.env
-ExecStart=${PROJECT_DIR}/.venv/bin/python -m router.server --host 127.0.0.1 --port 4000
+ExecStart=${BIN_DIR}/claude-gemini-router --host 127.0.0.1 --port 4000
 Restart=on-failure
 RestartSec=3
 

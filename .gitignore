@@ -1,4 +1,8 @@
-# Python virtual environments & caches
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Legacy Python virtual environments & caches
 .venv/
 venv/
 ENV/
@@ -16,6 +20,7 @@ build/
 dist/
 *.egg-info/
 .eggs/
+/omarchy-plugin/bin/omarchy-gemini-router-ctl
 
 # Logs & runtime state
 *.log
