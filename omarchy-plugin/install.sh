@@ -20,7 +20,13 @@ mkdir -p "${PLUGIN_DEST}/plugin" "${PLUGIN_DEST}/bin"
 mkdir -p "${CONFIG_DIR}" "${BIN_DIR}" "${SYSTEMD_USER_DIR}"
 
 # Build or locate Rust release binaries
-CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${PROJECT_DIR}/target}"
+if [[ -z "${CARGO_TARGET_DIR:-}" ]]; then
+  if [[ -f "/tmp/cargo-target-router/release/claude-gemini-router" ]]; then
+    CARGO_TARGET_DIR="/tmp/cargo-target-router"
+  else
+    CARGO_TARGET_DIR="${PROJECT_DIR}/target"
+  fi
+fi
 if command -v cargo >/dev/null 2>&1; then
   echo "==> Building Rust release binaries in ${PROJECT_DIR}..."
   (cd "${PROJECT_DIR}" && cargo build --release --locked --offline --target-dir "${CARGO_TARGET_DIR}")
@@ -48,6 +54,10 @@ fi
 if [[ -f "${PROJECT_DIR}/bin/codex-gemini" ]]; then
   cp -f "${PROJECT_DIR}/bin/codex-gemini" "${BIN_DIR}/codex-gemini"
   chmod 755 "${BIN_DIR}/codex-gemini"
+fi
+
+if [[ -x "${HOME}/google-cloud-sdk/bin/gcloud" && ! -e "${BIN_DIR}/gcloud" ]]; then
+  ln -sf "${HOME}/google-cloud-sdk/bin/gcloud" "${BIN_DIR}/gcloud"
 fi
 
 if [[ ! -f "${CONFIG_DIR}/router.env" ]]; then

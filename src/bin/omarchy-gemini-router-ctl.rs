@@ -1007,11 +1007,12 @@ fn probe_adc_status_offline() -> Value {
     })
 }
 
-fn which_in_path(binary: &str) -> bool {
+fn resolve_binary_in_path(binary: &str) -> Option<PathBuf> {
     let home = home_dir();
     let current_path = env::var("PATH").unwrap_or_default();
     let search_path = format!(
-        "{}/.local/share/mise/shims:{}/.local/bin:{}",
+        "{}/google-cloud-sdk/bin:/home/arch/google-cloud-sdk/bin:/opt/google-cloud-sdk/bin:{}/.local/share/mise/shims:{}/.local/bin:{}:/usr/local/bin:/usr/bin",
+        home.display(),
         home.display(),
         home.display(),
         current_path
@@ -1023,11 +1024,15 @@ fn which_in_path(binary: &str) -> bool {
         let candidate = Path::new(dir).join(binary);
         if let Ok(meta) = fs::metadata(&candidate) {
             if meta.is_file() && (meta.permissions().mode() & 0o111 != 0) {
-                return true;
+                return Some(candidate);
             }
         }
     }
-    false
+    None
+}
+
+fn which_in_path(binary: &str) -> bool {
+    resolve_binary_in_path(binary).is_some()
 }
 
 fn build_status_dict() -> Result<Map<String, Value>, String> {
@@ -1430,45 +1435,74 @@ fn cmd_logs(lines: usize) -> Result<Map<String, Value>, String> {
 }
 
 fn cmd_adc_login() -> Result<Map<String, Value>, String> {
-    let candidates: &[&[&str]] = &[
-        &[
-            "uwsm-app",
-            "--",
-            "xdg-terminal-exec",
-            "gcloud",
-            "auth",
-            "application-default",
-            "login",
+    let Some(gcloud_path) = resolve_binary_in_path("gcloud") else {
+        let val = json!({
+            "ok": false,
+            "launched": false,
+            "error": "gcloud CLI not found. Install google-cloud-sdk first.",
+        });
+        return Ok(val.as_object().unwrap().clone());
+    };
+    let gcloud_bin = gcloud_path.to_string_lossy().to_string();
+
+    let candidates: Vec<Vec<String>> = vec![
+        vec![
+            "uwsm-app".to_string(),
+            "--".to_string(),
+            "xdg-terminal-exec".to_string(),
+            gcloud_bin.clone(),
+            "auth".to_string(),
+            "application-default".to_string(),
+            "login".to_string(),
         ],
-        &[
-            "xdg-terminal-exec",
-            "gcloud",
-            "auth",
-            "application-default",
-            "login",
+        vec![
+            "xdg-terminal-exec".to_string(),
+            gcloud_bin.clone(),
+            "auth".to_string(),
+            "application-default".to_string(),
+            "login".to_string(),
         ],
-        &[
-            "kitty",
-            "-e",
-            "gcloud",
-            "auth",
-            "application-default",
-            "login",
+        vec![
+            "ghostty".to_string(),
+            "-e".to_string(),
+            gcloud_bin.clone(),
+            "auth".to_string(),
+            "application-default".to_string(),
+            "login".to_string(),
         ],
-        &[
-            "alacritty",
-            "-e",
-            "gcloud",
-            "auth",
-            "application-default",
-            "login",
+        vec![
+            "kitty".to_string(),
+            "-e".to_string(),
+            gcloud_bin.clone(),
+            "auth".to_string(),
+            "application-default".to_string(),
+            "login".to_string(),
+        ],
+        vec![
+            "alacritty".to_string(),
+            "-e".to_string(),
+            gcloud_bin,
+            "auth".to_string(),
+            "application-default".to_string(),
+            "login".to_string(),
         ],
     ];
 
+    let home = home_dir();
+    let current_path = env::var("PATH").unwrap_or_default();
+    let enriched_path = format!(
+        "{}/google-cloud-sdk/bin:{}/.local/share/mise/shims:{}/.local/bin:{}",
+        home.display(),
+        home.display(),
+        home.display(),
+        current_path
+    );
+
     for term_cmd in candidates {
-        if which_in_path(term_cmd[0]) {
-            if Command::new(term_cmd[0])
+        if let Some(launcher_bin) = resolve_binary_in_path(&term_cmd[0]) {
+            if Command::new(launcher_bin)
                 .args(&term_cmd[1..])
+                .env("PATH", &enriched_path)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())

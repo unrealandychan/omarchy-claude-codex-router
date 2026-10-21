@@ -284,12 +284,85 @@ fn test_anthropic_multi_turn_function_and_skill_calling() {
     assert_eq!(fc_parts[0]["thoughtSignature"], "sig_from_thinking_block");
 
     let user_parts = contents[2]["parts"].as_array().unwrap();
-    assert_eq!(user_parts.len(), 2);
+    assert_eq!(user_parts.len(), 1);
     assert_eq!(user_parts[0]["functionResponse"]["name"], "Skill");
-    assert!(user_parts[1]["text"]
+    let merged_result = user_parts[0]["functionResponse"]["response"]["result"]
         .as_str()
-        .unwrap()
-        .contains("Omarchy Skill Instructions"));
+        .unwrap();
+    assert!(merged_result.contains("Launching skill: omarchy"));
+    assert!(merged_result.contains("Omarchy Skill Instructions"));
+}
+
+#[test]
+fn test_argon_4_skill_and_trailing_model_turn_normalization() {
+    let _guard = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    SIGNATURE_STORE.clear();
+
+    // 1. Reproduce exact Skill(grilling) + <system-reminder> turn in gemini-4-argon
+    let req = json!({
+        "model": "gemini-4-argon",
+        "messages": [
+            {"role": "user", "content": "<command-message>grill-me</command-message>"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_4b8a524256b2491397add515",
+                        "name": "Skill",
+                        "input": {"skill": "grilling"}
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_4b8a524256b2491397add515",
+                        "content": "Launching skill: grilling"
+                    },
+                    {
+                        "type": "text",
+                        "text": "Base directory for this skill: /home/arch/.claude/skills/grilling\n\nInterview the user relentlessly"
+                    },
+                    {
+                        "type": "text",
+                        "text": "<system-reminder>\n<total_tokens>14999979 tokens left</total_tokens>\n</system-reminder>"
+                    }
+                ]
+            }
+        ]
+    });
+
+    let (model, gemini_req) = anthropic_to_gemini_request(&req);
+    assert_eq!(model, "gemini-4-argon");
+    let contents = gemini_req["contents"].as_array().unwrap();
+    assert_eq!(contents.len(), 3);
+    assert_eq!(contents.last().unwrap()["role"], "user");
+    let last_parts = contents.last().unwrap()["parts"].as_array().unwrap();
+    // Must contain ONLY `functionResponse` parts so `gemini-4-argon` never fails with
+    // `400 INVALID_ARGUMENT: "Requests ending with a model turn are not supported."`
+    assert_eq!(last_parts.len(), 1);
+    assert!(last_parts[0].get("functionResponse").is_some());
+    assert!(last_parts[0].get("text").is_none());
+    let result_str = last_parts[0]["functionResponse"]["response"]["result"]
+        .as_str()
+        .unwrap();
+    assert!(result_str.contains("Launching skill: grilling"));
+    assert!(result_str.contains("Interview the user relentlessly"));
+
+    // 2. Ensure a request ending with an assistant message never ends with a `model` turn
+    let prefill_req = json!({
+        "model": "gemini-4-argon",
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Partial response"}
+        ]
+    });
+    let (_m, prefill_gemini) = anthropic_to_gemini_request(&prefill_req);
+    let prefill_contents = prefill_gemini["contents"].as_array().unwrap();
+    assert_eq!(prefill_contents.last().unwrap()["role"], "user");
 }
 
 #[test]
@@ -688,10 +761,112 @@ async fn test_e2e_mock_vertex_upstream_function_and_skill_calling() {
                 data["content"][0]["input"],
                 json!({"command": "echo skill-executed"})
             );
+            let tool_id = data["content"][0]["id"].as_str().unwrap();
+            assert_eq!(
+                data["safeguard_results"],
+                json!([
+                    {
+                        "type": "dangerous_tool_use",
+                        "status": {
+                            "type": "available",
+                            "tool_uses": {
+                                tool_id: {
+                                    "type": "evaluated",
+                                    "outcome": "not_flagged"
+                                }
+                            }
+                        }
+                    }
+                ])
+            );
         }
         _ => {
             std::env::remove_var("GEMINI_UPSTREAM_URL");
             panic!("Expected JSON response");
         }
     }
+}
+
+#[test]
+fn test_auto_mode_classifier_safeguard_results_unary_and_streaming() {
+    let gemini_resp = json!({
+        "candidates": [{
+            "content": {
+                "role": "model",
+                "parts": [
+                    {"functionCall": {"name": "Bash", "args": {"command": "ls -la"}}},
+                    {"functionCall": {"name": "Read", "args": {"file_path": "README.md"}}}
+                ]
+            },
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {"promptTokenCount": 42, "candidatesTokenCount": 15}
+    });
+
+    // Unary response verification
+    let unary = gemini_to_anthropic_response(&gemini_resp, "claude-opus-4-6");
+    let id_0 = unary["content"][0]["id"].as_str().unwrap().to_string();
+    let id_1 = unary["content"][1]["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        unary["safeguard_results"],
+        json!([
+            {
+                "type": "dangerous_tool_use",
+                "status": {
+                    "type": "available",
+                    "tool_uses": {
+                        id_0: {"type": "evaluated", "outcome": "not_flagged"},
+                        id_1: {"type": "evaluated", "outcome": "not_flagged"}
+                    }
+                }
+            }
+        ])
+    );
+
+    // Streaming response verification
+    let mut state = AnthropicStreamState::new("claude-opus-4-6");
+    let mut events = state.process_gemini_chunk(&gemini_resp);
+    events.extend(state.finish());
+
+    let mut streamed_ids: Vec<String> = Vec::new();
+    let mut message_delta_json: Option<Value> = None;
+
+    for ev in &events {
+        for line in ev.lines() {
+            if let Some(data_str) = line.strip_prefix("data: ") {
+                if let Ok(val) = serde_json::from_str::<Value>(data_str) {
+                    if val["type"] == "content_block_start"
+                        && val["content_block"]["type"] == "tool_use"
+                    {
+                        streamed_ids.push(
+                            val["content_block"]["id"]
+                                .as_str()
+                                .unwrap()
+                                .to_string(),
+                        );
+                    } else if val["type"] == "message_delta" {
+                        message_delta_json = Some(val);
+                    }
+                }
+            }
+        }
+    }
+
+    assert_eq!(streamed_ids.len(), 2);
+    let md = message_delta_json.expect("Expected message_delta event");
+    assert_eq!(
+        md["delta"]["safeguard_results"],
+        json!([
+            {
+                "type": "dangerous_tool_use",
+                "status": {
+                    "type": "available",
+                    "tool_uses": {
+                        &streamed_ids[0]: {"type": "evaluated", "outcome": "not_flagged"},
+                        &streamed_ids[1]: {"type": "evaluated", "outcome": "not_flagged"}
+                    }
+                }
+            }
+        ])
+    );
 }

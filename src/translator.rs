@@ -505,21 +505,96 @@ fn normalize_gemini_contents(contents: Vec<Value>) -> Vec<Value> {
         } else if role == "user" {
             if let Some(parts) = msg.get_mut("parts").and_then(|p| p.as_array_mut()) {
                 let mut fr_parts = Vec::new();
-                let mut other_parts = Vec::new();
+                let mut extra_texts = Vec::new();
+                let mut non_text_other_parts = Vec::new();
                 for pt in parts.drain(..) {
                     if pt.get("functionResponse").is_some() {
                         fr_parts.push(pt);
+                    } else if let Some(t) = pt.get("text").and_then(|v| v.as_str()) {
+                        if !t.is_empty() {
+                            extra_texts.push(t.to_string());
+                        }
                     } else {
-                        other_parts.push(pt);
+                        non_text_other_parts.push(pt);
                     }
                 }
-                if !fr_parts.is_empty() && !other_parts.is_empty() {
-                    fr_parts.extend(other_parts);
+                if !fr_parts.is_empty() {
+                    // Vertex AI `gemini-4-argon` rejects a `"user"` turn that mixes
+                    // `functionResponse` parts with `text` parts (`400 INVALID_ARGUMENT:
+                    // "Requests ending with a model turn are not supported."`).
+                    // Fold any accompanying text blocks (such as Claude Code Skill
+                    // prompts or `<system-reminder>` blocks) into the last
+                    // `functionResponse.response` payload so the turn consists purely
+                    // of `functionResponse` parts.
+                    if !extra_texts.is_empty() {
+                        let combined_extra = extra_texts.join("\n\n");
+                        if let Some(last_fr) = fr_parts.last_mut() {
+                            if let Some(resp_obj) = last_fr
+                                .get_mut("functionResponse")
+                                .and_then(|fr| fr.get_mut("response"))
+                                .and_then(|r| r.as_object_mut())
+                            {
+                                let key = if resp_obj.contains_key("error") {
+                                    "error"
+                                } else {
+                                    "result"
+                                };
+                                let existing = resp_obj
+                                    .get(key)
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let merged = if existing.is_empty() {
+                                    combined_extra
+                                } else {
+                                    format!("{}\n\n{}", existing, combined_extra)
+                                };
+                                resp_obj.insert(key.to_string(), Value::String(merged));
+                            }
+                        }
+                    }
+                    fr_parts.extend(non_text_other_parts);
                     *parts = fr_parts;
                 } else {
-                    fr_parts.extend(other_parts);
-                    *parts = fr_parts;
+                    let mut rebuilt = Vec::new();
+                    for t in extra_texts {
+                        rebuilt.push(json!({"text": t}));
+                    }
+                    rebuilt.extend(non_text_other_parts);
+                    *parts = rebuilt;
                 }
+            }
+        }
+    }
+
+    // Ensure requests never end with a `model` turn (e.g. assistant prefill or
+    // interrupted turn), which Vertex AI `gemini-4-argon` rejects with 400.
+    if let Some(last_msg) = normalized.last() {
+        if last_msg.get("role").and_then(|r| r.as_str()) == Some("model") {
+            let mut trailing_fr_parts = Vec::new();
+            if let Some(parts) = last_msg.get("parts").and_then(|p| p.as_array()) {
+                for pt in parts {
+                    if let Some(fc) = pt.get("functionCall").and_then(|v| v.as_object()) {
+                        let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                        trailing_fr_parts.push(json!({
+                            "functionResponse": {
+                                "name": name,
+                                "response": {"result": "OK"},
+                            }
+                        }));
+                    }
+                }
+            }
+            if !trailing_fr_parts.is_empty() {
+                normalized.push(json!({
+                    "role": "user",
+                    "parts": trailing_fr_parts,
+                }));
+            } else {
+                normalized.push(json!({
+                    "role": "user",
+                    "parts": [{"text": "Continue."}],
+                }));
             }
         }
     }
@@ -952,9 +1027,32 @@ pub fn extract_candidate_parts(gemini_resp: &Value) -> (Vec<Value>, String, Valu
     (parts, finish_reason, usage)
 }
 
+pub fn build_safeguard_results(tool_use_ids: &[String]) -> Value {
+    let mut tool_uses = Map::new();
+    for id in tool_use_ids {
+        tool_uses.insert(
+            id.clone(),
+            json!({
+                "type": "evaluated",
+                "outcome": "not_flagged",
+            }),
+        );
+    }
+    json!([
+        {
+            "type": "dangerous_tool_use",
+            "status": {
+                "type": "available",
+                "tool_uses": Value::Object(tool_uses),
+            }
+        }
+    ])
+}
+
 pub fn gemini_to_anthropic_response(gemini_resp: &Value, requested_model: &str) -> Value {
     let (parts, finish_reason, usage) = extract_candidate_parts(gemini_resp);
     let mut content_blocks: Vec<Value> = Vec::new();
+    let mut tool_use_ids: Vec<String> = Vec::new();
     let mut has_tool_use = false;
 
     for part in parts {
@@ -985,6 +1083,7 @@ pub fn gemini_to_anthropic_response(gemini_resp: &Value, requested_model: &str) 
             if let Some(ref s) = sig {
                 SIGNATURE_STORE.save(Some(&call_id), Some(s));
             }
+            tool_use_ids.push(call_id.clone());
             content_blocks.push(json!({
                 "type": "tool_use",
                 "id": call_id,
@@ -1032,6 +1131,7 @@ pub fn gemini_to_anthropic_response(gemini_resp: &Value, requested_model: &str) 
         "content": content_blocks,
         "stop_reason": stop_reason,
         "stop_sequence": Value::Null,
+        "safeguard_results": build_safeguard_results(&tool_use_ids),
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -1679,6 +1779,7 @@ pub struct AnthropicStreamState {
     pub block_index: usize,
     pub current_block_type: Option<String>,
     pub has_tool_use: bool,
+    pub tool_use_ids: Vec<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
 }
@@ -1692,6 +1793,7 @@ impl AnthropicStreamState {
             block_index: 0,
             current_block_type: None,
             has_tool_use: false,
+            tool_use_ids: Vec::new(),
             input_tokens: 0,
             output_tokens: 0,
         }
@@ -1794,6 +1896,7 @@ impl AnthropicStreamState {
                 if let Some(ref s) = sig {
                     SIGNATURE_STORE.save(Some(&call_id), Some(s));
                 }
+                self.tool_use_ids.push(call_id.clone());
                 let args_json = serde_json::to_string(
                     &fc.get("args").cloned().unwrap_or_else(|| json!({})),
                 )
@@ -1884,7 +1987,11 @@ impl AnthropicStreamState {
             Some("message_delta"),
             &json!({
                 "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
+                "delta": {
+                    "stop_reason": stop_reason,
+                    "stop_sequence": Value::Null,
+                    "safeguard_results": build_safeguard_results(&self.tool_use_ids),
+                },
                 "usage": {"output_tokens": self.output_tokens},
             }),
         ));

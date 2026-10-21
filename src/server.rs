@@ -251,6 +251,17 @@ pub struct VertexGeminiUpstream {
 
 impl VertexGeminiUpstream {
     pub fn new(auth: Arc<ADCAuthManager>) -> Self {
+        for key in ["NO_PROXY", "no_proxy"] {
+            let current = std::env::var(key).unwrap_or_default();
+            if !current.contains("127.0.0.1") {
+                let updated = if current.trim().is_empty() {
+                    "127.0.0.1,localhost,::1".to_string()
+                } else {
+                    format!("{},127.0.0.1,localhost,::1", current)
+                };
+                std::env::set_var(key, updated);
+            }
+        }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(600))
             .connect_timeout(Duration::from_secs(30))
