@@ -1,6 +1,6 @@
 {
   "name": "gemini-adc-router",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Keyless (ADC-only) Vertex AI Gemini 3.8 & Gemini 4.0 router and plugin for Claude Code and OpenAI Codex",
   "author": {
     "name": "Eddie Chan",

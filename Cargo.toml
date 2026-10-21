@@ -1,6 +1,6 @@
 [package]
 name = "omarchy-claude-codex-router"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Eddie Chan <eddie.chan@connect.ust.hk>"]
 description = "Vertex AI Gemini Router for Claude Code & OpenAI Codex in Rust"
