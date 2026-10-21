@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - name: functional & security ctl test suite
+        run: ./tests/test-ctl.sh
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck install.sh uninstall.sh bin/claude-gemini bin/codex-gemini tests/test-ctl.sh
+      - name: install Qt QML tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq qt6-declarative-dev-tools qml6-module-qtquick qml6-module-qtquick-layouts
+      - name: QML syntax
+        run: for f in plugin/*.qml; do /usr/lib/qt6/bin/qmlformat "$f" > /dev/null; done
+      - name: qmllint (informational)
+        continue-on-error: true
+        run: /usr/lib/qt6/bin/qmllint --import disable --unqualified disable plugin/*.qml
+      - name: versions in sync
+        run: |
+          cargo_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          manifest_version=$(jq -r .version manifest.json)
+          echo "Cargo.toml=$cargo_version manifest.json=$manifest_version"
+          test "$cargo_version" = "$manifest_version"

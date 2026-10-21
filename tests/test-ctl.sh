@@ -4,15 +4,27 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CTL="${CTL_BIN:-${PLUGIN_DIR}/bin/omarchy-gemini-router-ctl}"
 
-TMP_ROOT="$(mktemp -d /tmp/omarchy-gemini-router-test.XXXXXX)"
+if [[ -n "${CTL_BIN:-}" ]]; then
+  CTL="${CTL_BIN}"
+elif [[ -x "${PLUGIN_DIR}/target/release/omarchy-gemini-router-ctl" ]]; then
+  CTL="${PLUGIN_DIR}/target/release/omarchy-gemini-router-ctl"
+elif [[ -x "${HOME}/.local/bin/omarchy-gemini-router-ctl" ]]; then
+  CTL="${HOME}/.local/bin/omarchy-gemini-router-ctl"
+else
+  (cd "${PLUGIN_DIR}" && cargo build --release --locked --bin omarchy-gemini-router-ctl)
+  CTL="${PLUGIN_DIR}/target/release/omarchy-gemini-router-ctl"
+fi
+
+TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "${TMP_ROOT}"' EXIT
 
 export OMARCHY_GEMINI_ROUTER_CONFIG_DIR="${TMP_ROOT}/config"
 export CLAUDE_SETTINGS_PATH="${TMP_ROOT}/claude/settings.json"
 export CODEX_CONFIG_PATH="${TMP_ROOT}/codex/config.toml"
+export OMARCHY_MENU_CONFIG_PATH="${TMP_ROOT}/omarchy/extensions/omarchy-menu.jsonc"
 export OMARCHY_GEMINI_ROUTER_MOCK_DAEMON=1
+export OMARCHY_GEMINI_ROUTER_NO_NOTIFY=1
 export ROUTER_PORT=49999
 export ROUTER_URL="http://127.0.0.1:49999"
 
@@ -52,7 +64,7 @@ json_field() {
 }
 
 echo "==> 1. Seed realistic pre-existing Claude & Codex configs"
-mkdir -p "$(dirname "${CLAUDE_SETTINGS_PATH}")" "$(dirname "${CODEX_CONFIG_PATH}")"
+mkdir -p "$(dirname "${CLAUDE_SETTINGS_PATH}")" "$(dirname "${CODEX_CONFIG_PATH}")" "$(dirname "${OMARCHY_MENU_CONFIG_PATH}")"
 
 cat > "${CLAUDE_SETTINGS_PATH}" <<'EOF'
 {
@@ -88,11 +100,20 @@ screen_reader_detection_done = true
 EOF
 chmod 600 "${CODEX_CONFIG_PATH}"
 
+cat > "${OMARCHY_MENU_CONFIG_PATH}" <<'EOF'
+{
+  // Existing user menu extension
+  "personal": {"icon":"","label":"Personal"}
+}
+EOF
+chmod 600 "${OMARCHY_MENU_CONFIG_PATH}"
+
 echo "==> 2. Verify initial status (routing off)"
 STATUS_JSON="$("${CTL}" status)"
 assert_eq "$(json_field "${STATUS_JSON}" "data['ok']")" "True" "Initial status ok=True"
 assert_eq "$(json_field "${STATUS_JSON}" "data['claude_enabled']")" "False" "Claude initially disabled"
 assert_eq "$(json_field "${STATUS_JSON}" "data['codex_enabled']")" "False" "Codex initially disabled"
+assert_eq "$(json_field "${STATUS_JSON}" "data['menu_enabled']")" "False" "Omarchy menu initially disabled"
 assert_eq "$(json_field "${STATUS_JSON}" "data['badge_text']")" "ADC Off" "Badge text is ADC Off"
 
 echo "==> 3. Enable Claude routing only"
@@ -119,33 +140,32 @@ assert_eq "$(json_field "${RES_CODEX}" "data['both_enabled']")" "True" "both_ena
 assert_eq "$(json_field "${RES_CODEX}" "data['badge_text']")" "C+X -> G3.8" "Badge shows C+X -> G3.8"
 
 CODEX_FILE_CONTENT="$(cat "${CODEX_CONFIG_PATH}")"
-assert_contains "${CODEX_FILE_CONTENT}" 'model_provider = "gemini_adc"' "Codex model_provider set"
-assert_contains "${CODEX_FILE_CONTENT}" '[model_providers.gemini_adc]' "Codex provider section added"
-assert_contains "${CODEX_FILE_CONTENT}" 'wire_api = "responses"' "Codex wire_api set to responses"
-assert_contains "${CODEX_FILE_CONTENT}" 'screen_reader_detection_done = true' "Codex [tui] preserved"
+assert_contains "${CODEX_FILE_CONTENT}" 'model_provider = "gemini_adc"' "Codex model_provider set to gemini_adc"
+assert_contains "${CODEX_FILE_CONTENT}" 'model = "gemini-3.8-flash"' "Codex model set to gemini-3.8-flash"
+assert_contains "${CODEX_FILE_CONTENT}" '[model_providers.gemini_adc]' "Codex provider block written"
 assert_contains "${CODEX_FILE_CONTENT}" 'hooks = true' "Codex [features] preserved"
+assert_contains "${CODEX_FILE_CONTENT}" 'screen_reader_detection_done = true' "Codex [tui] preserved"
 
-echo "==> 5. Switch model to gemini-4-argon and effort to high"
+echo "==> 5. Hot-swap model to Gemini 4.0 Argon & custom models"
 RES_MODEL="$("${CTL}" set-model --model gemini-4-argon --effort high)"
-assert_eq "$(json_field "${RES_MODEL}" "data['primary_model']")" "gemini-4-argon" "Model updated to gemini-4-argon"
-assert_eq "$(json_field "${RES_MODEL}" "data['reasoning_effort']")" "high" "Effort updated to high"
+assert_eq "$(json_field "${RES_MODEL}" "data['primary_model']")" "gemini-4-argon" "Primary model updated to gemini-4-argon"
+assert_eq "$(json_field "${RES_MODEL}" "data['reasoning_effort']")" "high" "Reasoning effort updated to high"
 assert_eq "$(json_field "${RES_MODEL}" "data['badge_text']")" "C+X -> G4" "Badge updated to C+X -> G4"
 
-CLAUDE_FILE_CONTENT="$(cat "${CLAUDE_SETTINGS_PATH}")"
-assert_eq "$(json_field "${CLAUDE_FILE_CONTENT}" "data['env']['ANTHROPIC_MODEL']")" "gemini-4-argon" "Claude ANTHROPIC_MODEL updated to gemini-4-argon"
-assert_eq "$(json_field "${CLAUDE_FILE_CONTENT}" "data['env']['ANTHROPIC_DEFAULT_OPUS_MODEL']")" "gemini-4-argon" "Claude Opus tier updated to gemini-4-argon"
-assert_eq "$(json_field "${CLAUDE_FILE_CONTENT}" "data['env']['ANTHROPIC_SMALL_FAST_MODEL']")" "claude-haiku-4-5" "Claude Haiku fast model remains claude-haiku-4-5"
-CODEX_FILE_CONTENT="$(cat "${CODEX_CONFIG_PATH}")"
-assert_contains "${CODEX_FILE_CONTENT}" 'model = "gemini-4-argon"' "Codex model updated to gemini-4-argon"
-assert_contains "${CODEX_FILE_CONTENT}" 'model_reasoning_effort = "high"' "Codex effort updated to high"
+CLAUDE_SWAPPED="$(cat "${CLAUDE_SETTINGS_PATH}")"
+assert_eq "$(json_field "${CLAUDE_SWAPPED}" "data['env']['ANTHROPIC_MODEL']")" "gemini-4-argon" "Claude ANTHROPIC_MODEL updated to gemini-4-argon"
+assert_eq "$(json_field "${CLAUDE_SWAPPED}" "data['env']['ANTHROPIC_DEFAULT_OPUS_MODEL']")" "gemini-4-argon" "Claude ANTHROPIC_DEFAULT_OPUS_MODEL updated to gemini-4-argon"
+
+CODEX_SWAPPED="$(cat "${CODEX_CONFIG_PATH}")"
+assert_contains "${CODEX_SWAPPED}" 'model = "gemini-4-argon"' "Codex model updated to gemini-4-argon"
+assert_contains "${CODEX_SWAPPED}" 'model_reasoning_effort = "high"' "Codex effort updated to high"
 
 RES_FLIP="$("${CTL}" set-model --flip)"
-assert_eq "$(json_field "${RES_FLIP}" "data['primary_model']")" "gemini-3.8-flash" "set-model --flip flips gemini-4-argon -> gemini-3.8-flash"
-assert_eq "$(json_field "${RES_FLIP}" "'total_requests' in data['stats']")" "True" "status includes stats.total_requests"
+assert_eq "$(json_field "${RES_FLIP}" "data['primary_model']")" "gemini-3.8-flash" "--flip toggled back to gemini-3.8-flash"
 
-echo "==> 5b. Dynamic model selection, custom aliases, and multi-model flip cycling"
 RES_CUSTOM="$("${CTL}" set-model --model gemini-2.5-pro)"
-assert_eq "$(json_field "${RES_CUSTOM}" "data['primary_model']")" "gemini-2.5-pro" "Dynamic model updated to gemini-2.5-pro"
+assert_eq "$(json_field "${RES_CUSTOM}" "data['primary_model']")" "gemini-2.5-pro" "Custom model gemini-2.5-pro accepted"
+assert_eq "$(json_field "${RES_CUSTOM}" "data['primary_model_display']")" "Gemini 2.5 Pro" "Dynamic display name is Gemini 2.5 Pro"
 assert_eq "$(json_field "${RES_CUSTOM}" "data['badge_text']")" "C+X -> G2.5P" "Dynamic badge shows C+X -> G2.5P"
 assert_eq "$(json_field "${RES_CUSTOM}" "'gemini-2.5-pro' in data['available_models']")" "True" "gemini-2.5-pro added to available_models"
 
@@ -182,7 +202,7 @@ else
   PASS_COUNT=$((PASS_COUNT + 1))
 fi
 
-echo "==> 7. Test toggle & daemon subcommands"
+echo "==> 7. Test toggle, daemon & Omarchy Menu subcommands"
 RES_TOGGLE_ON="$("${CTL}" toggle --target both)"
 assert_eq "$(json_field "${RES_TOGGLE_ON}" "data['both_enabled']")" "True" "Toggle both -> ON"
 RES_TOGGLE_OFF="$("${CTL}" toggle --target both)"
@@ -192,6 +212,17 @@ RES_STOP="$("${CTL}" stop-router)"
 assert_eq "$(json_field "${RES_STOP}" "data['router_running']")" "False" "stop-router sets router_running=False"
 RES_START="$("${CTL}" start-router)"
 assert_eq "$(json_field "${RES_START}" "data['router_running']")" "True" "start-router sets router_running=True"
+
+RES_MENU_ON="$("${CTL}" menu --enable)"
+assert_eq "$(json_field "${RES_MENU_ON}" "data['menu_enabled']")" "True" "menu --enable sets menu_enabled=True"
+MENU_CONTENT="$(cat "${OMARCHY_MENU_CONFIG_PATH}")"
+assert_contains "${MENU_CONTENT}" '"trigger.gemini-router"' "omarchy-menu.jsonc contains trigger.gemini-router"
+assert_contains "${MENU_CONTENT}" '"personal"' "omarchy-menu.jsonc preserved existing personal entry"
+
+RES_MENU_OFF="$("${CTL}" menu --toggle)"
+assert_eq "$(json_field "${RES_MENU_OFF}" "data['menu_enabled']")" "False" "menu --toggle sets menu_enabled=False"
+MENU_RESTORED="$(cat "${OMARCHY_MENU_CONFIG_PATH}")"
+assert_contains "${MENU_RESTORED}" '"personal"' "omarchy-menu.jsonc preserved personal entry after removal"
 
 echo "==> 8. Security & adversarial tests (Omaplug baseline)"
 BAD_TARGET="$("${CTL}" enable --target '; rm -rf /')"

@@ -1,6 +1,13 @@
 # Omarchy Claude Code & OpenAI Codex $\rightarrow$ Vertex AI Gemini Router (Rust Edition)
 
-A high-performance, zero-dependency-drift **Rust** proxy server (`claude-gemini-router`) and **Omarchy status bar plugin + CLI** (`arch.gemini-router` / `omarchy-gemini-router-ctl`) that routes **Claude Code** (`claude`) and **OpenAI Codex CLI** (`codex`) directly to **Google Cloud Vertex AI** for **Gemini 3.8 Flash** (`gemini-3.8-flash`), **Gemini 4.0 Argon** (`gemini-4-argon`), and **Gemini 3.1 Pro / 3 Flash** using **Application Default Credentials (ADC)** — with **zero API keys**.
+> High-performance, zero-dependency-drift **Rust** proxy server (`claude-gemini-router`) and **Omarchy status bar plugin + CLI** (`arch.gemini-router` / `omarchy-gemini-router-ctl`) that routes **Claude Code** (`claude`) and **OpenAI Codex CLI** (`codex`) directly to **Google Cloud Vertex AI** for **Gemini 3.8 Flash** (`gemini-3.8-flash`), **Gemini 4.0 Argon** (`gemini-4-argon`), and **Gemini 3.1 Pro / 3 Flash** using **Application Default Credentials (ADC)** — with **zero API keys**.
+
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Language: Rust / QML](https://img.shields.io/badge/Language-Rust%20%2F%20QML-orange.svg)
+![Platform: Linux / Omarchy](https://img.shields.io/badge/Platform-Linux%20%2F%20Omarchy-blue.svg)
+![Version: 1.0.0](https://img.shields.io/badge/Version-1.0.0-brightgreen.svg)
+
+![Gemini ADC Router Preview](preview.png)
 
 ---
 
@@ -12,10 +19,13 @@ A high-performance, zero-dependency-drift **Rust** proxy server (`claude-gemini-
 - [Model Tier & Reasoning Effort Routing](#model-tier--reasoning-effort-routing)
 - [Dynamic Model Configuration Tutorial](#dynamic-model-configuration-tutorial)
 - [Supported HTTP Endpoints](#supported-http-endpoints)
+- [Omarchy Bar Widget Configuration (`shell.json`)](#omarchy-bar-widget-configuration-shelljson)
 - [Installation & Quick Start](#installation--quick-start)
   - [1. Full Installation (Daemon + CLI + Omarchy Bar Plugin)](#1-full-installation-daemon--cli--omarchy-bar-plugin)
-  - [2. Build from Source with Cargo](#2-build-from-source-with-cargo)
-  - [3. One-Command Wrapper Scripts](#3-one-command-wrapper-scripts)
+  - [2. Install via Omarchy Plugin Manager](#2-install-via-omarchy-plugin-manager)
+  - [3. Build from Source with Cargo](#3-build-from-source-with-cargo)
+  - [4. One-Command Wrapper Scripts](#4-one-command-wrapper-scripts)
+- [Installer & Runtime Scope](#installer--runtime-scope)
 - [CLI Reference (`omarchy-gemini-router-ctl`)](#cli-reference-omarchy-gemini-router-ctl)
 - [Router Daemon CLI & Environment Variables](#router-daemon-cli--environment-variables)
 - [Testing & Verification](#testing--verification)
@@ -175,19 +185,17 @@ omarchy-gemini-router-ctl restart-router
 ```
 
 ### Method 4: Live HTTP Hot-Swap API (`POST /config`)
-Hot-swap models on the running router daemon without restarting Claude Code or OpenAI Codex:
+Hot-swap models on the running router daemon without restarting Claude Code or OpenAI Codex by sending a JSON `POST` request to `http://127.0.0.1:4000/config` (which `omarchy-gemini-router-ctl set-model` performs automatically over a local TCP socket):
 
-```bash
-curl -fsS -X POST http://127.0.0.1:4000/config \
-  -H "Content-Type: application/json" \
-  -d '{
-    "primary_model": "gemini-2.5-pro",
-    "fast_model": "gemini-2.5-flash",
-    "fallback_model": "gemini-3.8-flash",
-    "available_models": ["gemini-3.8-flash", "gemini-4-argon", "gemini-2.5-pro"],
-    "reasoning_effort": "high",
-    "hot_swap": true
-  }'
+```json
+{
+  "primary_model": "gemini-2.5-pro",
+  "fast_model": "gemini-2.5-flash",
+  "fallback_model": "gemini-3.8-flash",
+  "available_models": ["gemini-3.8-flash", "gemini-4-argon", "gemini-2.5-pro"],
+  "reasoning_effort": "high",
+  "hot_swap": true
+}
 ```
 
 ### Method 5: Per-Session Wrapper Flags (`claude-gemini` & `codex-gemini`)
@@ -217,6 +225,29 @@ codex-gemini --model=gemini-3.1-pro-preview --effort=xhigh
 
 ---
 
+## Omarchy Bar Widget Configuration (`shell.json`)
+
+Widget settings can be customized on the `arch.gemini-router` entry in `~/.config/omarchy/shell.json` (matching the schema in `manifest.json`):
+
+```json
+{
+  "id": "arch.gemini-router",
+  "badgeStyle": "compact",
+  "notificationsEnabled": true,
+  "autoOpenOnAuthError": false,
+  "pollIntervalSeconds": 5
+}
+```
+
+| Setting | Default | Description |
+| :--- | :--- | :--- |
+| `badgeStyle` | `"compact"` | Status bar label format: `"compact"` (`C+X -> G3.8`), `"full"` (`Claude+Codex -> gemini-3.8-flash`), or `"icon"` (icon only). |
+| `notificationsEnabled` | `true` | Send desktop notifications when switching routing targets, models, or when ADC re-authentication is required. |
+| `autoOpenOnAuthError` | `false` | Automatically open the Gemini Router popup panel when ADC credentials expire while routing is enabled. |
+| `pollIntervalSeconds` | `5` | Background status polling interval in seconds (`2`–`60`; paused while the screen is locked). |
+
+---
+
 ## Installation & Quick Start
 
 ### Prerequisites
@@ -234,16 +265,24 @@ codex-gemini --model=gemini-3.1-pro-preview --effort=xhigh
 git clone https://github.com/unrealandychan/omarchy-claude-codex-router.git
 cd omarchy-claude-codex-router
 
-./omarchy-plugin/install.sh
+./install.sh
 ```
 
-`./omarchy-plugin/install.sh` performs the following:
+`./install.sh` performs the following:
 - Compiles the optimized release binaries (`claude-gemini-router` and `omarchy-gemini-router-ctl`).
 - Installs `claude-gemini-router`, `omarchy-gemini-router-ctl`, `claude-gemini`, and `codex-gemini` into `~/.local/bin/`.
 - Installs and starts the systemd user service `claude-gemini-router.service` on `http://127.0.0.1:4000`.
-- Installs the Omarchy bar widget into `~/.config/omarchy/plugins/arch.gemini-router` and registers it in `~/.config/omarchy/shell.json`.
+- Links the Omarchy bar widget into `~/.config/omarchy/plugins/arch.gemini-router` and registers it in `~/.config/omarchy/shell.json`.
 
-### 2. Build from Source with Cargo
+### 2. Install via Omarchy Plugin Manager
+
+```bash
+omarchy plugin add https://github.com/unrealandychan/omarchy-claude-codex-router.git --enable
+```
+
+If you install the QML bar widget via `omarchy plugin add` before building the Rust daemon, open the `󰚩` bar widget popup and click **Install Rust Daemon & CLI (`install.sh`)** to build and start the local router service in a terminal window.
+
+### 3. Build from Source with Cargo
 
 ```bash
 cargo build --release --locked
@@ -252,7 +291,7 @@ cargo build --release --locked
 #   ./target/release/omarchy-gemini-router-ctl
 ```
 
-### 3. One-Command Wrapper Scripts
+### 4. One-Command Wrapper Scripts
 
 Launch Claude Code or OpenAI Codex routed through the local Rust ADC proxy without modifying your global config files:
 
@@ -268,31 +307,59 @@ Launch Claude Code or OpenAI Codex routed through the local Rust ADC proxy witho
 
 ---
 
+## Installer & Runtime Scope
+
+`install.sh` and `uninstall.sh` run entirely as your user, without privilege escalation or download tools; nothing is downloaded except the exact-pinned Rust crates in `Cargo.lock` that `cargo build --locked` fetches from crates.io, verified against `Cargo.lock` checksums.
+
+`install.sh` touches only these user-scoped paths:
+
+| Path | Change |
+| :--- | :--- |
+| `./target/` | `cargo build --locked --release` output inside the checkout |
+| `~/.local/bin/claude-gemini-router` | Installed router daemon binary; a different existing file is moved to `*.bak.<timestamp>`, never overwritten |
+| `~/.local/bin/omarchy-gemini-router-ctl` | Installed plugin CLI binary (same backup rule) |
+| `~/.local/bin/claude-gemini`, `~/.local/bin/codex-gemini` | Installed wrapper scripts (same backup rule) |
+| `~/.config/omarchy/gemini-router/router.env` | Default router environment file (created only if absent, `0600`) |
+| `~/.config/systemd/user/claude-gemini-router.service` | User systemd service (`127.0.0.1:4000`, `WorkingDirectory=%h`); backed up if modified |
+| `${XDG_STATE_HOME:-~/.local/state}/omarchy/arch.gemini-router/install-receipt.json` | SHA-256 of installed files and source checkout path (directory `0700`, file `0600`) |
+| `~/.config/omarchy/plugins/arch.gemini-router` | Symlink to the checkout; an existing different entry is moved to `*.bak.<timestamp>` |
+| `~/.config/omarchy/shell.json` | Backed up, then `{"id": "arch.gemini-router"}` is added to the bar's right section if absent, using an `O_NOFOLLOW` + `dir_fd` atomic replace that refuses symlinks and files owned by another user |
+
+`uninstall.sh` verifies SHA-256 provenance against `install-receipt.json` before removing any binary, service unit, or symlink, disables routing to losslessly restore `~/.claude/settings.json` and `~/.codex/config.toml` from their backups, and removes the `SUPER+SPACE` menu block if enabled.
+
+---
+
 ## CLI Reference (`omarchy-gemini-router-ctl`)
 
-All `omarchy-gemini-router-ctl` commands output structured JSON:
+All `omarchy-gemini-router-ctl` commands output structured JSON (pass `--notify` to also send a desktop notification via `omarchy-notification-send`):
 
 ```bash
-# View full router, ADC, Claude Code, and Codex status + telemetry
+# View full router, ADC, Claude Code, Codex, and menu status + telemetry
 omarchy-gemini-router-ctl status
 
 # Enable routing for Claude Code (~/.claude/settings.json), Codex (~/.codex/config.toml), or both
-omarchy-gemini-router-ctl enable --target both
+omarchy-gemini-router-ctl enable --target both --notify
 omarchy-gemini-router-ctl enable --target claude --model gemini-4-argon
 omarchy-gemini-router-ctl enable --target codex --model gemini-3.8-flash --effort high
 
 # Toggle routing state on/off
-omarchy-gemini-router-ctl toggle --target both
+omarchy-gemini-router-ctl toggle --target both --notify
 omarchy-gemini-router-ctl toggle --target claude
 omarchy-gemini-router-ctl toggle --target codex
 
 # Hot-swap active Gemini model & reasoning effort across daemon + client configs
-omarchy-gemini-router-ctl set-model --model gemini-4-argon --effort high
+omarchy-gemini-router-ctl set-model --model gemini-4-argon --effort high --notify
 omarchy-gemini-router-ctl set-model --model gemini-3.8-flash --effort medium
-omarchy-gemini-router-ctl set-model --flip
+omarchy-gemini-router-ctl set-model --flip --notify
 
 # Disable routing and losslessly restore original ~/.claude/settings.json and ~/.codex/config.toml
-omarchy-gemini-router-ctl disable --target both
+omarchy-gemini-router-ctl disable --target both --notify
+
+# Opt-in / opt-out of the SUPER+SPACE Omarchy Menu entry (~/.config/omarchy/extensions/menu.sh)
+omarchy-gemini-router-ctl menu --enable
+omarchy-gemini-router-ctl menu --disable
+omarchy-gemini-router-ctl menu --toggle
+omarchy-gemini-router-ctl menu --status
 
 # Manage the background router daemon
 omarchy-gemini-router-ctl start-router
@@ -337,8 +404,8 @@ Run both the Rust integration test suite and the Omarchy CLI/plugin security & f
 # 1. Run Rust unit & integration tests (ADC stripping, schema sanitizer, multi-turn tool/skill calls, SSE streaming)
 cargo test
 
-# 2. Run the 55-assertion Omarchy CTL & security test suite
-./omarchy-plugin/tests/test-ctl.sh
+# 2. Run the 67-assertion Omarchy CTL & security test suite
+./tests/test-ctl.sh
 ```
 
 ---
@@ -347,6 +414,12 @@ cargo test
 
 ```text
 omarchy-claude-codex-router/
+├── manifest.json                      # Omarchy bar-widget plugin manifest (arch.gemini-router v1.0.0)
+├── preview.png                        # Omarchy Marketplace preview screenshot
+├── install.sh                         # Security-hardened user installer (receipts, backups, atomic writes)
+├── uninstall.sh                       # Provenance-verified user uninstaller
+├── plugin/
+│   └── GeminiRouter.qml               # Quickshell status bar widget & control popup
 ├── Cargo.toml                         # Rust package manifest & dependencies
 ├── Cargo.lock                         # Locked dependency graph
 ├── src/
@@ -358,18 +431,11 @@ omarchy-claude-codex-router/
 │       ├── claude-gemini-router.rs    # Router daemon CLI entrypoint
 │       └── omarchy-gemini-router-ctl.rs # Omarchy plugin backend CLI & config manager
 ├── tests/
-│   └── router_tests.rs                # Integration tests for schemas, tool/skill calling, streaming, and server endpoints
+│   ├── router_tests.rs                # Integration tests for schemas, tool/skill calling, streaming, and server endpoints
+│   └── test-ctl.sh                    # 67-assertion functional & security test suite for omarchy-gemini-router-ctl
 ├── bin/
 │   ├── claude-gemini                  # Keyless launcher wrapper for Claude Code
 │   └── codex-gemini                   # Keyless launcher wrapper for OpenAI Codex
-├── omarchy-plugin/
-│   ├── manifest.json                  # Omarchy bar-widget plugin manifest (arch.gemini-router)
-│   ├── install.sh                     # Builds Rust release binaries, installs systemd service & bar widget
-│   ├── uninstall.sh                   # Cleanly restores configs and removes service/plugin
-│   ├── plugin/
-│   │   └── GeminiRouter.qml           # Quickshell status bar widget & control popup
-│   └── tests/
-│       └── test-ctl.sh                # 55-test functional & security test suite for omarchy-gemini-router-ctl
 ├── skills/
 │   └── gemini-adc-router/SKILL.md     # Agent skill definition
 └── commands/

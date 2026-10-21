@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "id": "arch.gemini-router",
+  "name": "Gemini ADC Router",
+  "version": "1.0.0",
+  "author": "Eddie Chan",
+  "license": "MIT",
+  "homepage": "https://github.com/unrealandychan/omarchy-claude-codex-router",
+  "description": "Route Claude Code and OpenAI Codex to Vertex AI Gemini 3.8 & 4.0 via Application Default Credentials (ADC) with zero API keys.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "plugin/GeminiRouter.qml"
+  },
+  "barWidget": {
+    "displayName": "Gemini ADC Router",
+    "description": "Toggle Claude Code & Codex routing to Vertex AI Gemini 3.8 / 4.0 via ADC",
+    "category": "System",
+    "defaultSection": "right",
+    "allowMultiple": false,
+    "defaults": {
+      "badgeStyle": "compact",
+      "notificationsEnabled": true,
+      "autoOpenOnAuthError": false,
+      "pollIntervalSeconds": 8
+    },
+    "schema": [
+      {
+        "key": "badgeStyle",
+        "type": "enum",
+        "label": "Bar badge format",
+        "options": [
+          "compact",
+          "model",
+          "icon"
+        ],
+        "defaultValue": "compact",
+        "description": "Choose between compact routing badge (C+X -> G3.8), active model name, or icon-only display on the status bar."
+      },
+      {
+        "key": "notificationsEnabled",
+        "type": "boolean",
+        "label": "Desktop notifications",
+        "defaultValue": true,
+        "description": "Send a desktop notification when Vertex AI ADC credentials expire (401/403) while routing is active."
+      },
+      {
+        "key": "autoOpenOnAuthError",
+        "type": "boolean",
+        "label": "Auto-open panel on ADC expiry",
+        "defaultValue": false,
+        "description": "Automatically open the router control popup if Vertex AI ADC credentials fail while routing is active."
+      },
+      {
+        "key": "pollIntervalSeconds",
+        "type": "integer",
+        "label": "Background poll interval (seconds)",
+        "defaultValue": 8,
+        "description": "How often the widget checks router daemon and ADC status while the popup is closed."
+      }
+    ]
+  }
+}

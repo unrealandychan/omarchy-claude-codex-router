@@ -461,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "omarchy-claude-codex-router"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "bytes",

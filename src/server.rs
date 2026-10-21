@@ -27,7 +27,12 @@ pub const DEFAULT_AVAILABLE_MODELS: &[&str] = &[
 ];
 
 fn short_id(len: usize) -> String {
-    Uuid::new_v4().simple().to_string().chars().take(len).collect()
+    Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(len)
+        .collect()
 }
 
 pub fn fallback_model_for(model: &str) -> Option<&'static str> {
@@ -103,9 +108,7 @@ impl RouterMetrics {
             .filter(|s| !s.trim().is_empty())
             .map(|s| resolve_gemini_model(Some(s.trim())));
         let mut available_models = parse_available_models_env();
-        let active = env_model
-            .clone()
-            .unwrap_or_else(default_gemini_model);
+        let active = env_model.clone().unwrap_or_else(default_gemini_model);
         if !available_models.contains(&active) {
             available_models.insert(0, active.clone());
         }
@@ -170,7 +173,12 @@ impl RouterMetrics {
         self.record_client_request("claude", model, model);
     }
 
-    pub fn record_client_request(&self, client_kind: &str, requested_model: &str, vertex_model: &str) {
+    pub fn record_client_request(
+        &self,
+        client_kind: &str,
+        requested_model: &str,
+        vertex_model: &str,
+    ) {
         let mut g = self.inner.lock().unwrap();
         g.requests_total += 1;
         match client_kind {
@@ -416,17 +424,23 @@ impl VertexGeminiUpstream {
         payload: &Value,
     ) -> std::result::Result<Value, UpstreamError> {
         for attempt in 0..2 {
-            let url = self.build_endpoint_url(model, false).map_err(|e| UpstreamError {
-                status_code: 500,
-                message: e.to_string(),
-                details: None,
-            })?;
+            let url = self
+                .build_endpoint_url(model, false)
+                .map_err(|e| UpstreamError {
+                    status_code: 500,
+                    message: e.to_string(),
+                    details: None,
+                })?;
 
-            let headers = self.auth.get_auth_headers().await.map_err(|e| UpstreamError {
-                status_code: 401,
-                message: e.to_string(),
-                details: None,
-            })?;
+            let headers = self
+                .auth
+                .get_auth_headers()
+                .await
+                .map_err(|e| UpstreamError {
+                    status_code: 401,
+                    message: e.to_string(),
+                    details: None,
+                })?;
 
             let mut req = self.client.post(&url).json(payload);
             for (k, v) in headers {
@@ -481,17 +495,23 @@ impl VertexGeminiUpstream {
     {
         let mut resp_opt = None;
         for attempt in 0..2 {
-            let url = self.build_endpoint_url(model, true).map_err(|e| UpstreamError {
-                status_code: 500,
-                message: e.to_string(),
-                details: None,
-            })?;
+            let url = self
+                .build_endpoint_url(model, true)
+                .map_err(|e| UpstreamError {
+                    status_code: 500,
+                    message: e.to_string(),
+                    details: None,
+                })?;
 
-            let headers = self.auth.get_auth_headers().await.map_err(|e| UpstreamError {
-                status_code: 401,
-                message: e.to_string(),
-                details: None,
-            })?;
+            let headers = self
+                .auth
+                .get_auth_headers()
+                .await
+                .map_err(|e| UpstreamError {
+                    status_code: 401,
+                    message: e.to_string(),
+                    details: None,
+                })?;
 
             let mut req = self.client.post(&url).json(payload);
             for (k, v) in headers {
@@ -695,7 +715,11 @@ impl RouterServer {
                 if let Some(fallback) = self.resolve_fallback_model(model) {
                     if matches!(err.status_code, 400 | 403 | 404 | 429 | 500 | 503) {
                         self.metrics.inner.lock().unwrap().fallback_count += 1;
-                        match self.upstream.stream_generate_content(&fallback, payload).await {
+                        match self
+                            .upstream
+                            .stream_generate_content(&fallback, payload)
+                            .await
+                        {
                             Ok(rx) => return Ok((fallback, rx)),
                             Err(fb_err) => {
                                 if fb_err.status_code == 401 || fb_err.status_code == 403 {
@@ -740,23 +764,14 @@ impl RouterServer {
                 if let Some(obj) = status.as_object_mut() {
                     obj.insert("status".to_string(), Value::String("ok".to_string()));
                     obj.insert("adc".to_string(), adc_status);
-                    obj.insert(
-                        "default_model".to_string(),
-                        Value::String(default_model),
-                    );
-                    obj.insert(
-                        "primary_model".to_string(),
-                        Value::String(primary_model),
-                    );
+                    obj.insert("default_model".to_string(), Value::String(default_model));
+                    obj.insert("primary_model".to_string(), Value::String(primary_model));
                     obj.insert("fast_model".to_string(), Value::String(fast_model));
                     obj.insert(
                         "fallback_model".to_string(),
                         fallback_model.map(Value::String).unwrap_or(Value::Null),
                     );
-                    obj.insert(
-                        "available_models".to_string(),
-                        json!(available_models),
-                    );
+                    obj.insert("available_models".to_string(), json!(available_models));
                     obj.insert(
                         "reasoning_effort".to_string(),
                         Value::String(self.metrics.get_reasoning_effort()),
@@ -798,7 +813,11 @@ impl RouterServer {
                 {
                     if !m.trim().is_empty() {
                         self.metrics.set_default_model(m.trim());
-                        if body.get("hot_swap").and_then(|v| v.as_bool()).unwrap_or(true) {
+                        if body
+                            .get("hot_swap")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true)
+                        {
                             self.metrics.set_hot_swap_active(true);
                         }
                     }
@@ -820,7 +839,11 @@ impl RouterServer {
                 if let Some(e) = body.get("reasoning_effort").and_then(|v| v.as_str()) {
                     if !e.trim().is_empty() {
                         self.metrics.set_reasoning_effort(e.trim());
-                        if body.get("hot_swap").and_then(|v| v.as_bool()).unwrap_or(true) {
+                        if body
+                            .get("hot_swap")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true)
+                        {
                             self.metrics.set_hot_swap_active(true);
                         }
                     }
@@ -896,7 +919,10 @@ impl RouterServer {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(default_gemini_model);
-                let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                let stream = body
+                    .get("stream")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let (gemini_model, gemini_payload) = anthropic_to_gemini_request(&body);
                 self.metrics
                     .record_client_request("claude", &requested_model, &gemini_model);
@@ -915,14 +941,16 @@ impl RouterServer {
                                 .cloned()
                                 .unwrap_or_else(|| json!({}));
                             self.metrics.record_success(
-                                usage.get("promptTokenCount").and_then(|v| v.as_u64()).unwrap_or(0),
+                                usage
+                                    .get("promptTokenCount")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
                                 usage
                                     .get("candidatesTokenCount")
                                     .and_then(|v| v.as_u64())
                                     .unwrap_or(0),
                             );
-                            let resp =
-                                gemini_to_anthropic_response(&gemini_resp, &requested_model);
+                            let resp = gemini_to_anthropic_response(&gemini_resp, &requested_model);
                             RouterResponse::Json(200, resp)
                         }
                         Err(err) => {
@@ -1015,7 +1043,10 @@ impl RouterServer {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(default_gemini_model);
-                let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                let stream = body
+                    .get("stream")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let (gemini_model, gemini_payload) = openai_chat_to_gemini_request(&body);
                 self.metrics
                     .record_client_request("chat", &requested_model, &gemini_model);
@@ -1032,7 +1063,10 @@ impl RouterServer {
                                 .cloned()
                                 .unwrap_or_else(|| json!({}));
                             self.metrics.record_success(
-                                usage.get("promptTokenCount").and_then(|v| v.as_u64()).unwrap_or(0),
+                                usage
+                                    .get("promptTokenCount")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
                                 usage
                                     .get("candidatesTokenCount")
                                     .and_then(|v| v.as_u64())
@@ -1190,7 +1224,8 @@ impl RouterServer {
                                         }
                                     }
                                 }
-                                let finish_reason = if has_tool_calls { "tool_calls" } else { "stop" };
+                                let finish_reason =
+                                    if has_tool_calls { "tool_calls" } else { "stop" };
                                 let _ = tx
                                     .send(format_sse(
                                         None,
@@ -1244,7 +1279,10 @@ impl RouterServer {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(default_gemini_model);
-                let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                let stream = body
+                    .get("stream")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let (gemini_model, gemini_payload) = openai_responses_to_gemini_request(&body);
                 self.metrics
                     .record_client_request("codex", &requested_model, &gemini_model);
@@ -1261,7 +1299,10 @@ impl RouterServer {
                                 .cloned()
                                 .unwrap_or_else(|| json!({}));
                             self.metrics.record_success(
-                                usage.get("promptTokenCount").and_then(|v| v.as_u64()).unwrap_or(0),
+                                usage
+                                    .get("promptTokenCount")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
                                 usage
                                     .get("candidatesTokenCount")
                                     .and_then(|v| v.as_u64())

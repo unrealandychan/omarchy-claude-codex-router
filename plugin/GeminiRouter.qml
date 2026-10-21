@@ -10,9 +10,17 @@ BarWidget {
   id: root
   moduleName: "arch.gemini-router"
 
+  // User-configurable widget settings from manifest.json schema
+  property string badgeStyle: setting("badgeStyle", "compact")
+  property bool notificationsEnabled: setting("notificationsEnabled", true)
+  property bool autoOpenOnAuthError: setting("autoOpenOnAuthError", false)
+  property int pollIntervalSeconds: Math.max(3, Number(setting("pollIntervalSeconds", 8)) || 8)
+
   // Reactive Status Properties
+  property bool ctlMissing: false
   property bool routerRunning: false
   property bool serviceEnabled: false
+  property bool menuEnabled: false
   property string routerUrl: "http://127.0.0.1:4000"
   property int routerPort: 4000
   property bool claudeEnabled: false
@@ -23,6 +31,7 @@ BarWidget {
   property bool codexInstalled: true
   property string primaryModel: "gemini-3.8-flash"
   property string primaryModelDisplay: "Gemini 3.8 Flash"
+  property string primaryModelShort: "Gemini 3.8"
   property var modelPresets: [
     { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash", short: "Gemini 3.8", badge: "G3.8" },
     { id: "gemini-4-argon", label: "Gemini 4.0 Argon", short: "Gemini 4.0", badge: "G4" }
@@ -40,7 +49,7 @@ BarWidget {
   property string adcLocation: "global"
   property bool apiKeyUsed: false
   property string adcError: ""
-  property bool authPopupShown: false
+  property bool authAlertNotified: false
 
   // Live session telemetry
   property int totalRequests: 0
@@ -59,10 +68,32 @@ BarWidget {
   property bool showLogsPanel: false
   property string routerLogs: "Loading logs…"
 
-  readonly property string ctlPath: {
-    var resolved = Qt.resolvedUrl("../bin/omarchy-gemini-router-ctl")
-    var localPath = decodeURIComponent(String(resolved).replace(/^file:\/\//, ""))
-    return localPath
+  // Omarchy theme integration: load theme's green (color2), else fall back to Color.accent
+  property color doneColor: Color.accent
+
+  function loadDoneColor(raw) {
+    var match = String(raw || "").match(/^\s*(?:green|color2)\s*=\s*["']?(#[0-9A-Fa-f]{6})/m)
+    root.doneColor = match ? match[1] : Color.accent
+  }
+
+  FileView {
+    id: themeColors
+    path: Color.currentThemePath + "/colors.toml"
+    printErrors: false
+    onLoaded: root.loadDoneColor(text())
+    onLoadFailed: root.loadDoneColor("")
+  }
+
+  Connections {
+    target: Color
+    function onAccentChanged() { themeColors.reload() }
+  }
+
+  readonly property string ctlPath: Quickshell.env("HOME") + "/.local/bin/omarchy-gemini-router-ctl"
+
+  readonly property string installScriptPath: {
+    var resolved = Qt.resolvedUrl("../install.sh")
+    return decodeURIComponent(String(resolved).replace(/^file:\/\//, ""))
   }
 
   // Omarchy Shell panel contract: opened, open(), close(), toggle()
@@ -105,56 +136,82 @@ BarWidget {
     return String(v)
   }
 
+  function notifyAdcAlert() {
+    if (!root.notificationsEnabled) return
+    var detail = root.adcError !== ""
+      ? root.adcError
+      : "Vertex AI ADC credentials need refresh. Open Gemini ADC Router to re-authenticate."
+    Quickshell.execDetached([
+      "omarchy-notification-send",
+      "--app-name", "Gemini ADC Router",
+      "--urgency", "critical",
+      "--",
+      "Vertex AI ADC Auth Required",
+      detail
+    ])
+  }
+
   function applyStatusJson(rawText) {
+    var trimmed = String(rawText || "").trim()
+    if (trimmed === "") {
+      root.ctlMissing = true
+      return
+    }
     try {
-      var data = JSON.parse(rawText.trim())
+      var data = JSON.parse(trimmed)
       if (!data) return
+      root.ctlMissing = false
       if (data.error) {
-        root.notificationMessage = data.error
+        root.notificationMessage = String(data.error)
       }
       if (data.router_running !== undefined) root.routerRunning = data.router_running === true
       if (data.service_enabled !== undefined) root.serviceEnabled = data.service_enabled === true
-      if (data.router_url) root.routerUrl = data.router_url
-      if (data.router_port) root.routerPort = data.router_port
+      if (data.menu_enabled !== undefined) root.menuEnabled = data.menu_enabled === true
+      if (data.router_url) root.routerUrl = String(data.router_url)
+      if (data.router_port) root.routerPort = Number(data.router_port) || 4000
       if (data.claude_enabled !== undefined) root.claudeEnabled = data.claude_enabled === true
       if (data.codex_enabled !== undefined) root.codexEnabled = data.codex_enabled === true
       if (data.any_enabled !== undefined) root.anyEnabled = data.any_enabled === true
       if (data.both_enabled !== undefined) root.bothEnabled = data.both_enabled === true
       if (data.claude_installed !== undefined) root.claudeInstalled = data.claude_installed === true
       if (data.codex_installed !== undefined) root.codexInstalled = data.codex_installed === true
-      if (data.primary_model) root.primaryModel = data.primary_model
-      if (data.primary_model_display) root.primaryModelDisplay = data.primary_model_display
+      if (data.primary_model) root.primaryModel = String(data.primary_model)
+      if (data.primary_model_display) root.primaryModelDisplay = String(data.primary_model_display)
+      if (data.primary_model_short) root.primaryModelShort = String(data.primary_model_short)
       if (Array.isArray(data.model_presets) && data.model_presets.length > 0) {
         root.modelPresets = data.model_presets
       }
-      if (data.reasoning_effort) root.reasoningEffort = data.reasoning_effort
+      if (data.reasoning_effort) root.reasoningEffort = String(data.reasoning_effort)
       if (data.hot_swap_active !== undefined) root.hotSwapActive = data.hot_swap_active === true
-      if (data.status_label) root.statusLabel = data.status_label
-      if (data.badge_text) root.badgeText = data.badge_text
+      if (data.status_label) root.statusLabel = String(data.status_label)
+      if (data.badge_text) root.badgeText = String(data.badge_text)
       if (data.adc) {
         root.adcValid = data.adc.token_valid === true
         root.adcAuthAlert = data.adc.auth_alert === true
-        root.adcStatusCode = data.adc.auth_status_code || 0
-        root.adcProject = data.adc.project_id || "unknown"
-        root.adcLocation = data.adc.location || "global"
+        root.adcStatusCode = Number(data.adc.auth_status_code) || 0
+        root.adcProject = String(data.adc.project_id || "unknown")
+        root.adcLocation = String(data.adc.location || "global")
         root.apiKeyUsed = data.adc.api_key_used === true
-        root.adcError = data.adc.error || ""
+        root.adcError = String(data.adc.error || "")
         if (root.adcValid && !root.adcAuthAlert) {
-          root.authPopupShown = false
-        } else if (root.anyEnabled && (!root.adcValid || root.adcAuthAlert) && !root.authPopupShown) {
-          root.authPopupShown = true
-          root.openPopup()
+          root.authAlertNotified = false
+        } else if (root.anyEnabled && (!root.adcValid || root.adcAuthAlert) && !root.authAlertNotified) {
+          root.authAlertNotified = true
+          root.notifyAdcAlert()
+          if (root.autoOpenOnAuthError) {
+            root.openPopup()
+          }
         }
       }
       if (data.stats) {
-        root.totalRequests = data.stats.total_requests || 0
-        root.claudeRequests = data.stats.claude_requests || 0
-        root.codexRequests = data.stats.codex_requests || 0
-        root.totalTokens = data.stats.total_tokens || 0
-        root.reasoningTokens = data.stats.reasoning_tokens || 0
-        root.lastClient = data.stats.last_client || ""
-        root.lastVertexModel = data.stats.last_vertex_model || ""
-        root.lastLatencyMs = data.stats.last_latency_ms || 0
+        root.totalRequests = Number(data.stats.total_requests) || 0
+        root.claudeRequests = Number(data.stats.claude_requests) || 0
+        root.codexRequests = Number(data.stats.codex_requests) || 0
+        root.totalTokens = Number(data.stats.total_tokens) || 0
+        root.reasoningTokens = Number(data.stats.reasoning_tokens) || 0
+        root.lastClient = String(data.stats.last_client || "")
+        root.lastVertexModel = String(data.stats.last_vertex_model || "")
+        root.lastLatencyMs = Number(data.stats.last_latency_ms) || 0
       }
     } catch(e) {
       // ignore parse errors
@@ -162,21 +219,29 @@ BarWidget {
   }
 
   function refreshStatus() {
-    if (!statusProc.running) {
+    if (!statusProc.running && !installProc.running) {
       statusProc.running = true
     }
   }
 
   function runAction(argsList, notifyText) {
-    if (actionProc.running) return
+    if (actionProc.running || installProc.running) return
     root.isBusy = true
     if (notifyText) root.notificationMessage = notifyText
     actionProc.command = [root.ctlPath].concat(argsList)
     actionProc.running = true
   }
 
+  function runBootstrapInstall() {
+    if (installProc.running) return
+    root.isBusy = true
+    root.notificationMessage = "Building & installing Rust ADC router daemon…"
+    installProc.command = [root.installScriptPath]
+    installProc.running = true
+  }
+
   function fetchLogs() {
-    if (!logsProc.running) {
+    if (!logsProc.running && !root.ctlMissing) {
       logsProc.running = true
     }
   }
@@ -184,16 +249,21 @@ BarWidget {
   readonly property string displayIcon: root.anyEnabled ? "󰚩" : "󰘦"
 
   readonly property string displayText: {
-    if (root.vertical) return root.displayIcon
+    if (root.vertical || root.badgeStyle === "icon") return root.displayIcon
     if (root.isBusy) return root.displayIcon + " …"
+    if (root.ctlMissing) return root.displayIcon + " Setup"
     if (root.anyEnabled && (!root.adcValid || root.adcAuthAlert)) return "⚠ Auth Reset"
+    if (root.badgeStyle === "model") {
+      return root.displayIcon + " " + (root.anyEnabled ? root.primaryModelShort : "Direct")
+    }
     return root.displayIcon + " " + root.badgeText
   }
 
   readonly property color widgetColor: {
-    if (root.isBusy) return "#f9e2af"
-    if (root.anyEnabled && (!root.routerRunning || !root.adcValid || root.adcAuthAlert)) return "#f38ba8"
-    if (root.bothEnabled) return "#a6e3a1"
+    if (root.isBusy) return Color.accent
+    if (root.ctlMissing) return Color.urgent
+    if (root.anyEnabled && (!root.routerRunning || !root.adcValid || root.adcAuthAlert)) return Color.urgent
+    if (root.bothEnabled) return root.doneColor
     if (root.anyEnabled) return Color.accent
     return Color.foreground
   }
@@ -202,6 +272,10 @@ BarWidget {
     if (root.popupOpen) return ""
     var t = "󰚩 Gemini ADC Router\n"
     t += "───────────────────────────\n"
+    if (root.ctlMissing) {
+      t += "Status: Setup required (click to build & install)\n"
+      return t
+    }
     t += "Mode: " + root.statusLabel + "\n"
     t += "Model: " + root.primaryModel + " (" + root.reasoningEffort + ")\n"
     t += "Claude Code: " + (root.claudeEnabled ? "Routed (/v1/messages)" : "Direct") + "\n"
@@ -218,7 +292,7 @@ BarWidget {
 
   Timer {
     id: pollTimer
-    interval: root.popupOpen ? 4000 : 8000
+    interval: root.popupOpen ? 4000 : (root.pollIntervalSeconds * 1000)
     repeat: true
     running: true
     triggeredOnStart: true
@@ -259,6 +333,20 @@ BarWidget {
   }
 
   Process {
+    id: installProc
+    command: [root.installScriptPath]
+    running: false
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.isBusy = false
+        root.notificationMessage = "Installation complete"
+        root.refreshStatus()
+      }
+    }
+  }
+
+  Process {
     id: logsProc
     command: [root.ctlPath, "logs", "--lines", "40"]
     running: false
@@ -267,7 +355,7 @@ BarWidget {
       onStreamFinished: {
         try {
           var res = JSON.parse(text.trim())
-          root.routerLogs = res.text || "No logs available."
+          root.routerLogs = String(res.text || "No logs available.")
         } catch(e) {
           root.routerLogs = "Error loading logs."
         }
@@ -286,9 +374,13 @@ BarWidget {
     fontSize: Style.font.caption
     horizontalMargin: 6
     tooltipText: root.tooltipDetails
-    active: root.anyEnabled
+    active: root.anyEnabled || root.ctlMissing
     activeColor: root.widgetColor
     onPressed: function(btn) {
+      if (root.ctlMissing) {
+        root.togglePopup()
+        return
+      }
       if (btn === Qt.RightButton) {
         root.runAction(
           ["toggle", "--target", "both"],
@@ -343,6 +435,7 @@ BarWidget {
           spacing: Style.space(8)
 
           Text {
+            textFormat: Text.PlainText
             text: "󰚩"
             font.family: Style.font.family
             font.pixelSize: Style.font.title
@@ -351,6 +444,7 @@ BarWidget {
           }
 
           Text {
+            textFormat: Text.PlainText
             text: "Gemini ADC Router"
             font.family: Style.font.family
             font.pixelSize: Style.font.title
@@ -367,10 +461,10 @@ BarWidget {
             radius: Style.space(11)
             Layout.alignment: Qt.AlignVCenter
             color: root.anyEnabled
-              ? Qt.rgba(0.65, 0.89, 0.63, 0.2)
+              ? Qt.rgba(root.doneColor.r, root.doneColor.g, root.doneColor.b, 0.18)
               : Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.08)
             border.width: 1
-            border.color: root.anyEnabled ? "#a6e3a1" : Color.muted
+            border.color: root.anyEnabled ? root.doneColor : Color.muted
 
             Text {
               id: statusBadgeText
@@ -379,7 +473,7 @@ BarWidget {
               text: root.anyEnabled ? ("● " + root.badgeText) : "○ Direct Mode"
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
-              color: root.anyEnabled ? "#a6e3a1" : Color.muted
+              color: root.anyEnabled ? root.doneColor : Color.muted
             }
           }
 
@@ -415,15 +509,73 @@ BarWidget {
           }
         }
 
+        // Unbootstrapped Setup Banner (when added via omarchy plugin add before install.sh)
+        BorderSurface {
+          Layout.fillWidth: true
+          visible: root.ctlMissing
+          implicitHeight: setupCol.implicitHeight + topPadding + bottomPadding
+          radius: Style.space(6)
+          color: Qt.rgba(Color.urgent.r, Color.urgent.g, Color.urgent.b, 0.14)
+          border.width: 1
+          border.color: Color.urgent
+          topPadding: Style.space(10)
+          bottomPadding: Style.space(10)
+          leftPadding: Style.space(12)
+          rightPadding: Style.space(12)
+
+          ColumnLayout {
+            id: setupCol
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.leftMargin: parent.leftPadding
+            anchors.rightMargin: parent.rightPadding
+            anchors.topMargin: parent.topPadding
+            spacing: Style.space(6)
+
+            Text {
+              Layout.fillWidth: true
+              textFormat: Text.PlainText
+              text: "⚠ Rust Router Daemon Not Installed Yet"
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              color: Color.urgent
+              wrapMode: Text.WordWrap
+            }
+
+            Text {
+              Layout.fillWidth: true
+              textFormat: Text.PlainText
+              text: "Click below to compile and install claude-gemini-router and omarchy-gemini-router-ctl into ~/.local/bin."
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              color: Color.foreground
+              wrapMode: Text.WordWrap
+            }
+
+            Button {
+              Layout.fillWidth: true
+              Layout.preferredHeight: Style.space(28)
+              text: root.isBusy ? "Building & Installing…" : "Build & Install Daemon (./install.sh)"
+              bordered: true
+              accent: Color.urgent
+              selected: true
+              enabled: !root.isBusy
+              onClicked: root.runBootstrapInstall()
+            }
+          }
+        }
+
         // 401 / 403 Credential Reset Alert Popup Banner
         BorderSurface {
           Layout.fillWidth: true
-          visible: !root.adcValid || root.adcAuthAlert
+          visible: !root.ctlMissing && (!root.adcValid || root.adcAuthAlert)
           implicitHeight: authAlertCol.implicitHeight + topPadding + bottomPadding
           radius: Style.space(6)
-          color: Qt.rgba(0.95, 0.55, 0.66, 0.14)
+          color: Qt.rgba(Color.urgent.r, Color.urgent.g, Color.urgent.b, 0.14)
           border.width: 1
-          border.color: "#f38ba8"
+          border.color: Color.urgent
           topPadding: Style.space(10)
           bottomPadding: Style.space(10)
           leftPadding: Style.space(12)
@@ -442,11 +594,13 @@ BarWidget {
             Text {
               Layout.fillWidth: true
               textFormat: Text.PlainText
-              text: "⚠ Vertex AI Auth Issue (" + (root.adcStatusCode > 0 ? ("HTTP " + root.adcStatusCode) : "401 / 403") + ") — Reset Credential"
+              text: root.adcStatusCode > 0
+                ? ("⚠ Vertex AI Auth Error (HTTP " + root.adcStatusCode + ") — Credential Reset Required")
+                : "⚠ Vertex AI ADC Credentials Expired or Missing"
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
               font.bold: true
-              color: "#f38ba8"
+              color: Color.urgent
               wrapMode: Text.WordWrap
             }
 
@@ -471,7 +625,7 @@ BarWidget {
                 Layout.preferredHeight: Style.space(28)
                 text: "Reset Credential (ADC Login)"
                 bordered: true
-                accent: "#f38ba8"
+                accent: Color.urgent
                 selected: true
                 enabled: !root.isBusy
                 onClicked: root.runAction(
@@ -530,9 +684,9 @@ BarWidget {
                 text: "Route Both to Gemini"
                 iconText: "󰚩"
                 bordered: true
-                accent: "#a6e3a1"
+                accent: root.doneColor
                 selected: root.bothEnabled
-                enabled: !root.isBusy
+                enabled: !root.isBusy && !root.ctlMissing
                 onClicked: root.runAction(["enable", "--target", "both"], "Routing Claude & Codex to Gemini…")
               }
 
@@ -543,7 +697,7 @@ BarWidget {
                 iconText: "󰅖"
                 bordered: true
                 selected: !root.anyEnabled
-                enabled: !root.isBusy && root.anyEnabled
+                enabled: !root.isBusy && !root.ctlMissing && root.anyEnabled
                 onClicked: root.runAction(["disable", "--target", "both"], "Restoring direct Claude & Codex config…")
               }
             }
@@ -557,6 +711,7 @@ BarWidget {
                 Layout.fillWidth: true
                 spacing: Style.space(2)
                 Text {
+                  textFormat: Text.PlainText
                   text: "Claude Code (claude)"
                   font.bold: true
                   color: Color.foreground
@@ -564,10 +719,11 @@ BarWidget {
                   font.pixelSize: Style.font.caption
                 }
                 Text {
+                  textFormat: Text.PlainText
                   text: root.claudeEnabled
                     ? ("Routed -> " + root.primaryModel + " (/v1/messages)")
                     : "Direct (~/.claude/settings.json)"
-                  color: root.claudeEnabled ? "#a6e3a1" : Color.muted
+                  color: root.claudeEnabled ? root.doneColor : Color.muted
                   font.family: Style.font.family
                   font.pixelSize: Style.font.caption
                 }
@@ -577,9 +733,9 @@ BarWidget {
                 Layout.preferredHeight: Style.space(28)
                 text: root.claudeEnabled ? "ON (Routed)" : "OFF (Direct)"
                 bordered: true
-                accent: root.claudeEnabled ? "#a6e3a1" : Color.accent
+                accent: root.claudeEnabled ? root.doneColor : Color.accent
                 selected: root.claudeEnabled
-                enabled: !root.isBusy
+                enabled: !root.isBusy && !root.ctlMissing
                 onClicked: root.runAction(
                   ["toggle", "--target", "claude"],
                   root.claudeEnabled ? "Disabling Claude routing…" : "Routing Claude Code to Gemini…"
@@ -596,6 +752,7 @@ BarWidget {
                 Layout.fillWidth: true
                 spacing: Style.space(2)
                 Text {
+                  textFormat: Text.PlainText
                   text: "OpenAI Codex (codex)"
                   font.bold: true
                   color: Color.foreground
@@ -603,10 +760,11 @@ BarWidget {
                   font.pixelSize: Style.font.caption
                 }
                 Text {
+                  textFormat: Text.PlainText
                   text: root.codexEnabled
                     ? ("Routed -> " + root.primaryModel + " (/v1/responses)")
                     : "Direct (~/.codex/config.toml)"
-                  color: root.codexEnabled ? "#a6e3a1" : Color.muted
+                  color: root.codexEnabled ? root.doneColor : Color.muted
                   font.family: Style.font.family
                   font.pixelSize: Style.font.caption
                 }
@@ -616,9 +774,9 @@ BarWidget {
                 Layout.preferredHeight: Style.space(28)
                 text: root.codexEnabled ? "ON (Routed)" : "OFF (Direct)"
                 bordered: true
-                accent: root.codexEnabled ? "#a6e3a1" : Color.accent
+                accent: root.codexEnabled ? root.doneColor : Color.accent
                 selected: root.codexEnabled
-                enabled: !root.isBusy
+                enabled: !root.isBusy && !root.ctlMissing
                 onClicked: root.runAction(
                   ["toggle", "--target", "codex"],
                   root.codexEnabled ? "Disabling Codex routing…" : "Routing OpenAI Codex to Gemini…"
@@ -655,6 +813,7 @@ BarWidget {
               Layout.fillWidth: true
               spacing: Style.space(6)
               Text {
+                textFormat: Text.PlainText
                 text: "Active Vertex AI Gemini Model (" + root.primaryModel + ")"
                 font.bold: true
                 color: Color.muted
@@ -664,8 +823,9 @@ BarWidget {
                 elide: Text.ElideRight
               }
               Text {
+                textFormat: Text.PlainText
                 text: "Hot-Swap Ready"
-                color: root.hotSwapActive ? "#a6e3a1" : Color.muted
+                color: root.hotSwapActive ? root.doneColor : Color.muted
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
               }
@@ -683,15 +843,15 @@ BarWidget {
                   required property var modelData
                   Layout.fillWidth: true
                   Layout.preferredHeight: Style.space(28)
-                  text: modelData.label || modelData.id
-                  tooltipText: modelData.id || ""
+                  text: String(modelData.label || modelData.id || "")
+                  tooltipText: String(modelData.id || "")
                   bordered: true
                   accent: Color.accent
                   selected: root.primaryModel === modelData.id
-                  enabled: !root.isBusy
+                  enabled: !root.isBusy && !root.ctlMissing
                   onClicked: root.runAction(
-                    ["set-model", "--model", modelData.id],
-                    "Switched model to " + modelData.id
+                    ["set-model", "--model", String(modelData.id)],
+                    "Switched model to " + String(modelData.id)
                   )
                 }
               }
@@ -724,7 +884,7 @@ BarWidget {
                   selectByMouse: true
                   onAccepted: {
                     var val = customModelInput.text.trim()
-                    if (val.length > 0 && !root.isBusy) {
+                    if (val.length > 0 && !root.isBusy && !root.ctlMissing) {
                       root.runAction(
                         ["set-model", "--model", val],
                         "Switched model to " + val
@@ -736,6 +896,7 @@ BarWidget {
                   Text {
                     anchors.fill: parent
                     verticalAlignment: Text.AlignVCenter
+                    textFormat: Text.PlainText
                     text: "Custom model ID (e.g. gemini-2.5-pro, gemini-3.1-pro-preview)…"
                     font.family: Style.font.family
                     font.pixelSize: Style.font.caption
@@ -751,7 +912,7 @@ BarWidget {
                 text: "Use Model"
                 bordered: true
                 accent: Color.accent
-                enabled: !root.isBusy && customModelInput.text.trim().length > 0
+                enabled: !root.isBusy && !root.ctlMissing && customModelInput.text.trim().length > 0
                 onClicked: {
                   var val = customModelInput.text.trim()
                   if (val.length > 0) {
@@ -766,6 +927,7 @@ BarWidget {
             }
 
             Text {
+              textFormat: Text.PlainText
               text: "Reasoning Effort (Thinking Level)"
               font.bold: true
               color: Color.muted
@@ -787,7 +949,7 @@ BarWidget {
                   bordered: true
                   accent: Color.accent
                   selected: root.reasoningEffort === modelData
-                  enabled: !root.isBusy
+                  enabled: !root.isBusy && !root.ctlMissing
                   onClicked: root.runAction(
                     ["set-model", "--effort", modelData],
                     "Set reasoning effort to " + modelData
@@ -825,6 +987,7 @@ BarWidget {
               Layout.fillWidth: true
               spacing: Style.space(8)
               Text {
+                textFormat: Text.PlainText
                 text: "Router Daemon:"
                 font.bold: true
                 color: Color.muted
@@ -833,28 +996,9 @@ BarWidget {
                 Layout.preferredWidth: Style.space(105)
               }
               Text {
+                textFormat: Text.PlainText
                 text: (root.routerRunning ? "Online" : "Stopped") + " (" + root.routerUrl + ")"
-                color: root.routerRunning ? "#a6e3a1" : "#f38ba8"
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                Layout.fillWidth: true
-              }
-            }
-
-            RowLayout {
-              Layout.fillWidth: true
-              spacing: Style.space(8)
-              Text {
-                text: "Vertex AI ADC:"
-                font.bold: true
-                color: Color.muted
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                Layout.preferredWidth: Style.space(105)
-              }
-              Text {
-                text: (root.adcValid ? "Token Valid" : "Needs Login") + " · " + root.adcProject + " (" + root.adcLocation + ")"
-                color: root.adcValid ? "#a6e3a1" : "#f38ba8"
+                color: root.routerRunning ? root.doneColor : Color.urgent
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
                 Layout.fillWidth: true
@@ -866,6 +1010,30 @@ BarWidget {
               Layout.fillWidth: true
               spacing: Style.space(8)
               Text {
+                textFormat: Text.PlainText
+                text: "Vertex AI ADC:"
+                font.bold: true
+                color: Color.muted
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                Layout.preferredWidth: Style.space(105)
+              }
+              Text {
+                textFormat: Text.PlainText
+                text: (root.adcValid ? "Token Valid" : "Needs Login") + " · " + root.adcProject + " (" + root.adcLocation + ")"
+                color: root.adcValid ? root.doneColor : Color.urgent
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                Layout.fillWidth: true
+                elide: Text.ElideRight
+              }
+            }
+
+            RowLayout {
+              Layout.fillWidth: true
+              spacing: Style.space(8)
+              Text {
+                textFormat: Text.PlainText
                 text: "Session Stats:"
                 font.bold: true
                 color: Color.muted
@@ -874,6 +1042,7 @@ BarWidget {
                 Layout.preferredWidth: Style.space(105)
               }
               Text {
+                textFormat: Text.PlainText
                 text: root.totalRequests > 0
                   ? (root.totalRequests + " reqs (C:" + root.claudeRequests + " X:" + root.codexRequests + ") · "
                     + root.formatCompactNumber(root.totalTokens) + " tok"
@@ -889,6 +1058,41 @@ BarWidget {
 
             RowLayout {
               Layout.fillWidth: true
+              spacing: Style.space(8)
+              Text {
+                textFormat: Text.PlainText
+                text: "Omarchy Menu:"
+                font.bold: true
+                color: Color.muted
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                Layout.preferredWidth: Style.space(105)
+              }
+              Text {
+                textFormat: Text.PlainText
+                text: root.menuEnabled ? "Enabled (SUPER+SPACE)" : "Disabled"
+                color: root.menuEnabled ? root.doneColor : Color.muted
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                Layout.fillWidth: true
+                elide: Text.ElideRight
+              }
+              Button {
+                Layout.preferredHeight: Style.space(24)
+                text: root.menuEnabled ? "Remove Menu" : "Add to Menu"
+                bordered: true
+                accent: root.menuEnabled ? root.doneColor : Color.accent
+                selected: root.menuEnabled
+                enabled: !root.isBusy && !root.ctlMissing
+                onClicked: root.runAction(
+                  ["menu", "--toggle"],
+                  root.menuEnabled ? "Removed from Omarchy Menu" : "Added to Omarchy Menu (SUPER+SPACE)"
+                )
+              }
+            }
+
+            RowLayout {
+              Layout.fillWidth: true
               spacing: Style.space(6)
 
               Button {
@@ -896,7 +1100,7 @@ BarWidget {
                 Layout.preferredHeight: Style.space(26)
                 text: root.routerRunning ? "Restart" : "Start Router"
                 bordered: true
-                enabled: !root.isBusy
+                enabled: !root.isBusy && !root.ctlMissing
                 onClicked: root.runAction(
                   [root.routerRunning ? "restart-router" : "start-router"],
                   "Starting ADC router daemon…"
@@ -907,7 +1111,7 @@ BarWidget {
                 Layout.preferredHeight: Style.space(26)
                 text: "Stop"
                 bordered: true
-                enabled: !root.isBusy && root.routerRunning
+                enabled: !root.isBusy && !root.ctlMissing && root.routerRunning
                 onClicked: root.runAction(
                   ["stop-router"],
                   "Stopping ADC router daemon…"
@@ -919,7 +1123,7 @@ BarWidget {
                 Layout.preferredHeight: Style.space(26)
                 text: "ADC Re-login"
                 bordered: true
-                enabled: !root.isBusy
+                enabled: !root.isBusy && !root.ctlMissing
                 onClicked: root.runAction(["adc-login"], "Launching gcloud ADC login…")
               }
 
@@ -927,6 +1131,7 @@ BarWidget {
                 Layout.preferredHeight: Style.space(26)
                 text: root.showLogsPanel ? "Hide Logs" : "Logs"
                 bordered: true
+                enabled: !root.ctlMissing
                 onClicked: {
                   root.showLogsPanel = !root.showLogsPanel
                   if (root.showLogsPanel) root.fetchLogs()

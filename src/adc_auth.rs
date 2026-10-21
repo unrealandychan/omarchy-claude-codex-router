@@ -153,14 +153,7 @@ impl ADCAuthManager {
             summary
         );
         let _ = Command::new("notify-send")
-            .args([
-                "-u",
-                "critical",
-                "-a",
-                "Gemini ADC Router",
-                &title,
-                &body,
-            ])
+            .args(["-u", "critical", "-a", "Gemini ADC Router", &title, &body])
             .spawn();
     }
 
@@ -425,7 +418,12 @@ impl ADCAuthManager {
         // Fallback to gcloud CLI (also used if OAuth refresh returned a previously rejected token)
         let gcloud_bin = Self::find_gcloud_binary();
         if let Ok(out) = Command::new(&gcloud_bin)
-            .args(["auth", "application-default", "print-access-token", "--quiet"])
+            .args([
+                "auth",
+                "application-default",
+                "print-access-token",
+                "--quiet",
+            ])
             .output()
         {
             if out.status.success() {
@@ -455,8 +453,7 @@ impl ADCAuthManager {
             return Ok(candidate);
         }
 
-        let err_detail = oauth_err
-            .unwrap_or_else(|| "No valid ADC token found".to_string());
+        let err_detail = oauth_err.unwrap_or_else(|| "No valid ADC token found".to_string());
         self.record_auth_failure(401, &err_detail);
         Err(anyhow!(
             "Failed to obtain Google Cloud ADC credentials: {}. Run: gcloud auth application-default login",

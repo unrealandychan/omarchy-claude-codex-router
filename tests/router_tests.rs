@@ -4,8 +4,8 @@ use omarchy_claude_codex_router::translator::{
     anthropic_to_gemini_request, format_model_display_name, format_model_short_badge,
     format_model_short_label, gemini_to_anthropic_response, gemini_to_openai_chat_response,
     gemini_to_openai_responses, openai_chat_to_gemini_request, openai_responses_to_gemini_request,
-    resolve_gemini_model, sanitize_json_schema, AnthropicStreamState,
-    SKIP_THOUGHT_SIGNATURE_VALIDATOR, SIGNATURE_STORE,
+    resolve_gemini_model, sanitize_json_schema, AnthropicStreamState, SIGNATURE_STORE,
+    SKIP_THOUGHT_SIGNATURE_VALIDATOR,
 };
 use serde_json::{json, Value};
 use std::sync::Mutex;
@@ -140,9 +140,11 @@ fn test_anthropic_to_gemini_and_back() {
         gemini_payload["contents"][0]["parts"][0]["text"],
         "List files in current directory"
     );
-    assert!(gemini_payload["tools"][0]["functionDeclarations"][0]["parameters"]
-        .get("additionalProperties")
-        .is_none());
+    assert!(
+        gemini_payload["tools"][0]["functionDeclarations"][0]["parameters"]
+            .get("additionalProperties")
+            .is_none()
+    );
 
     let fake_gemini_resp = json!({
         "candidates": [
@@ -169,7 +171,10 @@ fn test_anthropic_to_gemini_and_back() {
     assert_eq!(anthropic_resp["stop_reason"], "tool_use");
     assert_eq!(anthropic_resp["content"][0]["type"], "tool_use");
     assert_eq!(anthropic_resp["content"][0]["name"], "bash");
-    assert_eq!(anthropic_resp["content"][0]["input"], json!({"command": "ls -la"}));
+    assert_eq!(
+        anthropic_resp["content"][0]["input"],
+        json!({"command": "ls -la"})
+    );
     assert_eq!(anthropic_resp["usage"]["input_tokens"], 25);
     assert_eq!(anthropic_resp["usage"]["output_tokens"], 12);
 }
@@ -458,10 +463,7 @@ fn test_anthropic_stream_function_call_preserves_signature() {
     let all_sse = format!("{}{}", events.join(""), end_events.join(""));
     assert!(all_sse.contains("\"type\":\"tool_use\""));
     assert!(all_sse.contains("\"stop_reason\":\"tool_use\""));
-    assert_eq!(
-        SIGNATURE_STORE.get(None).as_deref(),
-        Some("stream_sig_999")
-    );
+    assert_eq!(SIGNATURE_STORE.get(None).as_deref(), Some("stream_sig_999"));
 }
 
 #[test]
@@ -754,7 +756,10 @@ async fn test_e2e_mock_vertex_upstream_function_and_skill_calling() {
     }))
     .unwrap();
 
-    match server.handle_request("POST", "/v1/messages", &req_body).await {
+    match server
+        .handle_request("POST", "/v1/messages", &req_body)
+        .await
+    {
         RouterResponse::Json(code, data) => {
             std::env::remove_var("GEMINI_UPSTREAM_URL");
             assert_eq!(code, 200);
@@ -842,12 +847,7 @@ fn test_auto_mode_classifier_safeguard_results_unary_and_streaming() {
                     if val["type"] == "content_block_start"
                         && val["content_block"]["type"] == "tool_use"
                     {
-                        streamed_ids.push(
-                            val["content_block"]["id"]
-                                .as_str()
-                                .unwrap()
-                                .to_string(),
-                        );
+                        streamed_ids.push(val["content_block"]["id"].as_str().unwrap().to_string());
                     } else if val["type"] == "message_delta" {
                         message_delta_json = Some(val);
                     }
@@ -996,7 +996,10 @@ async fn test_401_auto_token_refresh_and_adc_file_mtime_invalidation() {
     }))
     .unwrap();
 
-    match server.handle_request("POST", "/v1/messages", &req_body).await {
+    match server
+        .handle_request("POST", "/v1/messages", &req_body)
+        .await
+    {
         RouterResponse::Json(code, data) => {
             assert_eq!(code, 200);
             assert_eq!(

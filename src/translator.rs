@@ -1,7 +1,7 @@
+use java_like_uuid::new_short_id;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{LazyLock, Mutex};
-use java_like_uuid::new_short_id;
 
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-3.1-pro-preview";
 pub const DEFAULT_FAST_GEMINI_MODEL: &str = "gemini-3-flash-preview";
@@ -179,7 +179,9 @@ pub fn format_model_display_name(model: &str) -> String {
         "gemini-3.8-flash" => "Gemini 3.8 Flash".to_string(),
         _ => {
             let mut parts: Vec<&str> = model.trim().split('-').collect();
-            if parts.len() > 2 && parts.last().map(|s| s.eq_ignore_ascii_case("preview")) == Some(true) {
+            if parts.len() > 2
+                && parts.last().map(|s| s.eq_ignore_ascii_case("preview")) == Some(true)
+            {
                 parts.pop();
             }
             parts
@@ -189,7 +191,8 @@ pub fn format_model_display_name(model: &str) -> String {
                     match chars.next() {
                         None => String::new(),
                         Some(first) => {
-                            first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                            first.to_uppercase().collect::<String>()
+                                + &chars.as_str().to_lowercase()
                         }
                     }
                 })
@@ -235,7 +238,10 @@ pub fn format_model_short_badge(model: &str) -> String {
     }
 }
 
-fn resolve_json_ref(ref_path: &str, root_schema: &Map<String, Value>) -> Option<Map<String, Value>> {
+fn resolve_json_ref(
+    ref_path: &str,
+    root_schema: &Map<String, Value>,
+) -> Option<Map<String, Value>> {
     if !ref_path.starts_with("#/") {
         return None;
     }
@@ -377,10 +383,18 @@ fn sanitize_schema_inner(
     .into_iter()
     .collect();
 
-    let supported_formats: HashSet<&str> =
-        ["enum", "date-time", "date", "time", "int32", "int64", "float", "double"]
-            .into_iter()
-            .collect();
+    let supported_formats: HashSet<&str> = [
+        "enum",
+        "date-time",
+        "date",
+        "time",
+        "int32",
+        "int64",
+        "float",
+        "double",
+    ]
+    .into_iter()
+    .collect();
 
     let mut cleaned = Map::new();
 
@@ -734,7 +748,11 @@ fn ensure_historical_tools_declared(
 ) -> Vec<Value> {
     let mut declared_names: HashSet<String> = fn_declarations
         .iter()
-        .filter_map(|d| d.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+        .filter_map(|d| {
+            d.get("name")
+                .and_then(|n| n.as_str())
+                .map(|s| s.to_string())
+        })
         .collect();
 
     for msg in contents {
@@ -822,10 +840,7 @@ pub fn anthropic_to_gemini_request(body: &Value) -> (String, Value) {
             }
         }
         if !sys_parts.is_empty() {
-            payload.insert(
-                "systemInstruction".to_string(),
-                json!({"parts": sys_parts}),
-            );
+            payload.insert("systemInstruction".to_string(), json!({"parts": sys_parts}));
         }
     }
 
@@ -1009,7 +1024,10 @@ pub fn anthropic_to_gemini_request(body: &Value) -> (String, Value) {
     }
 
     let normalized_contents = normalize_gemini_contents(raw_contents);
-    payload.insert("contents".to_string(), Value::Array(normalized_contents.clone()));
+    payload.insert(
+        "contents".to_string(),
+        Value::Array(normalized_contents.clone()),
+    );
 
     let mut fn_declarations: Vec<Value> = Vec::new();
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
@@ -1317,7 +1335,10 @@ pub fn openai_chat_to_gemini_request(body: &Value) -> (String, Value) {
         }
 
         if role == "tool" {
-            let call_id = msg.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
+            let call_id = msg
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let fn_name = msg
                 .get("name")
                 .and_then(|v| v.as_str())
@@ -1408,21 +1429,23 @@ pub fn openai_chat_to_gemini_request(body: &Value) -> (String, Value) {
     }
 
     if !sys_parts.is_empty() {
-        payload.insert(
-            "systemInstruction".to_string(),
-            json!({"parts": sys_parts}),
-        );
+        payload.insert("systemInstruction".to_string(), json!({"parts": sys_parts}));
     }
 
     let normalized_contents = normalize_gemini_contents(raw_contents);
-    payload.insert("contents".to_string(), Value::Array(normalized_contents.clone()));
+    payload.insert(
+        "contents".to_string(),
+        Value::Array(normalized_contents.clone()),
+    );
 
     let mut fn_declarations: Vec<Value> = Vec::new();
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
         for tool in tools {
             if let Some(tobj) = tool.as_object() {
                 let fn_def = if tobj.get("type").and_then(|t| t.as_str()) == Some("function") {
-                    tobj.get("function").and_then(|f| f.as_object()).unwrap_or(tobj)
+                    tobj.get("function")
+                        .and_then(|f| f.as_object())
+                        .unwrap_or(tobj)
                 } else {
                     tobj
                 };
@@ -1515,10 +1538,9 @@ pub fn gemini_to_openai_chat_response(gemini_resp: &Value, requested_model: &str
             if let Some(ref s) = sig {
                 SIGNATURE_STORE.save(Some(&call_id), Some(s));
             }
-            let args_str = serde_json::to_string(
-                &fc.get("args").cloned().unwrap_or_else(|| json!({})),
-            )
-            .unwrap_or_else(|_| "{}".to_string());
+            let args_str =
+                serde_json::to_string(&fc.get("args").cloned().unwrap_or_else(|| json!({})))
+                    .unwrap_or_else(|_| "{}".to_string());
             tool_calls.push(json!({
                 "id": call_id,
                 "type": "function",
@@ -1535,10 +1557,7 @@ pub fn gemini_to_openai_chat_response(gemini_resp: &Value, requested_model: &str
     let mut message = Map::new();
     message.insert("role".to_string(), Value::String("assistant".to_string()));
     if !text_chunks.is_empty() || tool_calls.is_empty() {
-        message.insert(
-            "content".to_string(),
-            Value::String(text_chunks.join("")),
-        );
+        message.insert("content".to_string(), Value::String(text_chunks.join("")));
     } else {
         message.insert("content".to_string(), Value::Null);
     }
@@ -1635,7 +1654,10 @@ pub fn openai_responses_to_gemini_request(body: &Value) -> (String, Value) {
                 Some(o) => o,
                 None => continue,
             };
-            let item_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("message");
+            let item_type = obj
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("message");
             if item_type == "function_call" {
                 let raw_args = obj.get("arguments");
                 let args = match raw_args {
@@ -1747,7 +1769,10 @@ pub fn openai_responses_to_gemini_request(body: &Value) -> (String, Value) {
     }
 
     let normalized_contents = normalize_gemini_contents(raw_contents);
-    payload.insert("contents".to_string(), Value::Array(normalized_contents.clone()));
+    payload.insert(
+        "contents".to_string(),
+        Value::Array(normalized_contents.clone()),
+    );
 
     let mut fn_declarations: Vec<Value> = Vec::new();
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
@@ -1756,7 +1781,9 @@ pub fn openai_responses_to_gemini_request(body: &Value) -> (String, Value) {
                 let fn_def = if tobj.get("type").and_then(|t| t.as_str()) == Some("function")
                     && tobj.contains_key("function")
                 {
-                    tobj.get("function").and_then(|f| f.as_object()).unwrap_or(tobj)
+                    tobj.get("function")
+                        .and_then(|f| f.as_object())
+                        .unwrap_or(tobj)
                 } else {
                     tobj
                 };
@@ -1827,10 +1854,9 @@ pub fn gemini_to_openai_responses(gemini_resp: &Value, requested_model: &str) ->
             if let Some(ref s) = sig {
                 SIGNATURE_STORE.save(Some(&call_id), Some(s));
             }
-            let args_str = serde_json::to_string(
-                &fc.get("args").cloned().unwrap_or_else(|| json!({})),
-            )
-            .unwrap_or_else(|_| "{}".to_string());
+            let args_str =
+                serde_json::to_string(&fc.get("args").cloned().unwrap_or_else(|| json!({})))
+                    .unwrap_or_else(|_| "{}".to_string());
             output_items.push(json!({
                 "id": format!("fc_{}", new_short_id(24)),
                 "type": "function_call",
@@ -2023,10 +2049,9 @@ impl AnthropicStreamState {
                     SIGNATURE_STORE.save(Some(&call_id), Some(s));
                 }
                 self.tool_use_ids.push(call_id.clone());
-                let args_json = serde_json::to_string(
-                    &fc.get("args").cloned().unwrap_or_else(|| json!({})),
-                )
-                .unwrap_or_else(|_| "{}".to_string());
+                let args_json =
+                    serde_json::to_string(&fc.get("args").cloned().unwrap_or_else(|| json!({})))
+                        .unwrap_or_else(|_| "{}".to_string());
 
                 out.push(format_sse(
                     Some("content_block_start"),

@@ -5,13 +5,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROUTER_ENV_FILE="${HOME}/.config/omarchy/gemini-router/router.env"
-if [[ -f "${ROUTER_ENV_FILE}" ]]; then
-  # shellcheck disable=SC1090
-  source "${ROUTER_ENV_FILE}"
+
+read_env_key() {
+  local key="$1"
+  local file="$2"
+  if [[ -f "$file" && ! -L "$file" ]]; then
+    awk -F= -v k="$key" '$1 == k { sub(/^[^=]*=/, ""); gsub(/^["'\'']|["'\'']$/, ""); print; exit }' "$file"
+  fi
+}
+
+if [[ -z "${ROUTER_PORT:-}" ]]; then
+  ROUTER_PORT="$(read_env_key "ROUTER_PORT" "${ROUTER_ENV_FILE}")"
 fi
 ROUTER_PORT="${ROUTER_PORT:-4000}"
 ROUTER_URL="http://127.0.0.1:${ROUTER_PORT}"
 
+if [[ -z "${GEMINI_PRIMARY_MODEL:-}" ]]; then
+  GEMINI_PRIMARY_MODEL="$(read_env_key "GEMINI_PRIMARY_MODEL" "${ROUTER_ENV_FILE}")"
+fi
 PRIMARY_MODEL="${GEMINI_PRIMARY_MODEL:-gemini-3.8-flash}"
 PRINT_ENV_ONLY=false
 START_ONLY=false
@@ -82,6 +93,19 @@ resolve_router_bin() {
   fi
 }
 
+resolve_ctl_bin() {
+  if [[ -x "${PROJECT_DIR}/target/release/omarchy-gemini-router-ctl" ]]; then
+    echo "${PROJECT_DIR}/target/release/omarchy-gemini-router-ctl"
+  elif command -v omarchy-gemini-router-ctl >/dev/null 2>&1; then
+    command -v omarchy-gemini-router-ctl
+  elif [[ -x "${HOME}/.local/bin/omarchy-gemini-router-ctl" ]]; then
+    echo "${HOME}/.local/bin/omarchy-gemini-router-ctl"
+  else
+    (cd "${PROJECT_DIR}" && cargo build --release --locked >&2)
+    echo "${PROJECT_DIR}/target/release/omarchy-gemini-router-ctl"
+  fi
+}
+
 if [[ "${START_ONLY}" == "true" ]]; then
   ROUTER_BIN="$(resolve_router_bin)"
   exec "${ROUTER_BIN}" --port "${ROUTER_PORT}" "$@"
@@ -90,21 +114,8 @@ fi
 # Ensure router is running in the background
 export NO_PROXY="127.0.0.1,localhost,${NO_PROXY:-}"
 export no_proxy="127.0.0.1,localhost,${no_proxy:-}"
-if ! curl --noproxy '*' -fsS "${ROUTER_URL}/health" >/dev/null 2>&1; then
-  echo "[claude-gemini] Starting Rust ADC router on ${ROUTER_URL}..." >&2
-  ROUTER_BIN="$(resolve_router_bin)"
-  (
-    cd "${PROJECT_DIR}"
-    nohup "${ROUTER_BIN}" --port "${ROUTER_PORT}" \
-      >/tmp/claude-gemini-router.log 2>&1 &
-  )
-  for _ in {1..30}; do
-    if curl --noproxy '*' -fsS "${ROUTER_URL}/health" >/dev/null 2>&1; then
-      break
-    fi
-    sleep 0.2
-  done
-fi
+CTL_BIN="$(resolve_ctl_bin)"
+"${CTL_BIN}" start-router >/dev/null 2>&1 || true
 
 unset ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY
 export CLAUDE_CODE_USE_VERTEX=0

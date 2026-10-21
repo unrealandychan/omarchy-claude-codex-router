@@ -20,6 +20,8 @@ const VALID_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
 
 const CODEX_BLOCK_BEGIN: &str = "# BEGIN OMARCHY_GEMINI_ADC_ROUTER";
 const CODEX_BLOCK_END: &str = "# END OMARCHY_GEMINI_ADC_ROUTER";
+const MENU_BLOCK_BEGIN: &str = "  // gemini-router-menu-start";
+const MENU_BLOCK_END: &str = "  // gemini-router-menu-end";
 
 const CLAUDE_MANAGED_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_BASE_URL",
@@ -38,13 +40,14 @@ struct Paths {
     env_file: PathBuf,
     claude_settings: PathBuf,
     codex_config: PathBuf,
+    menu_config: PathBuf,
     project_dir: PathBuf,
 }
 
 fn home_dir() -> PathBuf {
     env::var("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn get_paths() -> Paths {
@@ -58,6 +61,9 @@ fn get_paths() -> Paths {
     let codex_config = env::var("CODEX_CONFIG_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| home.join(".codex/config.toml"));
+    let menu_config = env::var("OMARCHY_MENU_CONFIG_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home.join(".config/omarchy/extensions/omarchy-menu.jsonc"));
 
     let mut default_project_dir = home.join("Projects/omarchy-claude-codex-router");
     if !default_project_dir.join("Cargo.toml").is_file() {
@@ -67,6 +73,11 @@ fn get_paths() -> Paths {
         }
     }
     if let Ok(exe_path) = env::current_exe() {
+        if let Some(p2) = exe_path.parent().and_then(|p| p.parent()) {
+            if p2.join("Cargo.toml").is_file() {
+                default_project_dir = p2.to_path_buf();
+            }
+        }
         if let Some(p3) = exe_path
             .parent()
             .and_then(|p| p.parent())
@@ -87,6 +98,7 @@ fn get_paths() -> Paths {
         config_dir,
         claude_settings,
         codex_config,
+        menu_config,
         project_dir,
     }
 }
@@ -206,10 +218,7 @@ fn write_file_safely(path: &Path, content: &str, mode: u32) -> Result<(), String
         }
     }
 
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file");
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp_name = format!(
         ".{}.tmp.{}.{}",
         file_name,
@@ -269,35 +278,53 @@ fn run_cmd(args: &[&str], timeout: Duration) -> (i32, String, String) {
     {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return (127, String::new(), format!("Executable not found: {}", args[0]));
+            return (
+                127,
+                String::new(),
+                format!("Executable not found: {}", args[0]),
+            );
         }
         Err(e) => return (1, String::new(), e.to_string()),
     };
 
     let start = Instant::now();
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stdout_pipe {
+            let _ = pipe.take(MAX_OUTPUT_BYTES).read_to_end(&mut buf);
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+    let stderr_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr_pipe {
+            let _ = pipe.take(MAX_OUTPUT_BYTES).read_to_end(&mut buf);
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => {
-                return match child.wait_with_output() {
-                    Ok(out) => {
-                        let code = out.status.code().unwrap_or(1);
-                        let stdout_s = String::from_utf8_lossy(
-                            &out.stdout[..out.stdout.len().min(MAX_OUTPUT_BYTES as usize)],
-                        )
-                        .into_owned();
-                        let stderr_s = String::from_utf8_lossy(
-                            &out.stderr[..out.stderr.len().min(MAX_OUTPUT_BYTES as usize)],
-                        )
-                        .into_owned();
-                        (code, stdout_s, stderr_s)
-                    }
-                    Err(e) => (1, String::new(), e.to_string()),
-                };
+            Ok(Some(status)) => {
+                let code = status.code().unwrap_or(1);
+                let stdout_s = stdout_handle.join().unwrap_or_default();
+                let stderr_s = stderr_handle.join().unwrap_or_default();
+                return (code, stdout_s, stderr_s);
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
-                    let _ = child.wait();
+                    let kill_deadline = Instant::now() + Duration::from_secs(2);
+                    while Instant::now() < kill_deadline {
+                        if let Ok(Some(_)) = child.try_wait() {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    let _ = stdout_handle.join();
+                    let _ = stderr_handle.join();
                     return (
                         124,
                         String::new(),
@@ -306,7 +333,11 @@ fn run_cmd(args: &[&str], timeout: Duration) -> (i32, String, String) {
                 }
                 thread::sleep(Duration::from_millis(25));
             }
-            Err(e) => return (1, String::new(), e.to_string()),
+            Err(e) => {
+                let _ = stdout_handle.join();
+                let _ = stderr_handle.join();
+                return (1, String::new(), e.to_string());
+            }
         }
     }
 }
@@ -373,10 +404,7 @@ fn load_state() -> Result<Map<String, Value>, String> {
         .ok()
         .and_then(|s| normalize_model(Some(&s)).ok())
         .unwrap_or_else(|| "gemini-3.8-flash".to_string());
-    default_state.insert(
-        "primary_model".to_string(),
-        Value::String(initial_primary),
-    );
+    default_state.insert("primary_model".to_string(), Value::String(initial_primary));
     default_state.insert(
         "reasoning_effort".to_string(),
         Value::String("medium".to_string()),
@@ -497,11 +525,7 @@ fn normalize_model(model: Option<&str>) -> Result<String, String> {
         "gemini-3.8" | "gemini-3.8-flash" | "3.8" | "flash" => {
             return Ok("gemini-3.8-flash".to_string());
         }
-        "gemini-3.1"
-        | "gemini-3.1-pro"
-        | "gemini-3.1-pro-preview"
-        | "3.1"
-        | "3.1-pro" => {
+        "gemini-3.1" | "gemini-3.1-pro" | "gemini-3.1-pro-preview" | "3.1" | "3.1-pro" => {
             return Ok("gemini-3.1-pro-preview".to_string());
         }
         "gemini-3.0-flash"
@@ -697,9 +721,8 @@ fn configure_claude_routing(
         }
     }
 
-    let out = serde_json::to_string_pretty(&Value::Object(settings))
-        .map_err(|e| e.to_string())?
-        + "\n";
+    let out =
+        serde_json::to_string_pretty(&Value::Object(settings)).map_err(|e| e.to_string())? + "\n";
     write_file_safely(&paths.claude_settings, &out, 0o600)
 }
 
@@ -899,7 +922,10 @@ fn local_http_request(
     };
     stream.write_all(req.as_bytes()).ok()?;
     let mut resp = String::new();
-    stream.read_to_string(&mut resp).ok()?;
+    stream
+        .take(MAX_OUTPUT_BYTES)
+        .read_to_string(&mut resp)
+        .ok()?;
     let (head, body_part) = resp.split_once("\r\n\r\n")?;
     let status_line = head.lines().next()?;
     let status_code: u16 = status_line.split_whitespace().nth(1)?.parse().ok()?;
@@ -1031,13 +1057,12 @@ fn start_router_daemon(state: &Map<String, Value>) -> (bool, String) {
     let home = home_dir();
     let candidates = [
         home.join(".local/bin/claude-gemini-router"),
-        paths.project_dir.join("target/release/claude-gemini-router"),
+        paths
+            .project_dir
+            .join("target/release/claude-gemini-router"),
     ];
     let Some(router_bin) = candidates.into_iter().find(|p| p.is_file()) else {
-        return (
-            false,
-            "claude-gemini-router binary not found".to_string(),
-        );
+        return (false, "claude-gemini-router binary not found".to_string());
     };
 
     let _ = fs::create_dir_all(&paths.config_dir);
@@ -1067,10 +1092,18 @@ fn start_router_daemon(state: &Map<String, Value>) -> (bool, String) {
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_err));
-    if let Some(fm) = state.get("fast_model").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(fm) = state
+        .get("fast_model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
         cmd.env("GEMINI_FAST_MODEL", fm);
     }
-    if let Some(fb) = state.get("fallback_model").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(fb) = state
+        .get("fallback_model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
         cmd.env("GEMINI_FALLBACK_MODEL", fb);
     }
     let spawn_res = cmd.spawn();
@@ -1199,6 +1232,154 @@ fn resolve_binary_in_path(binary: &str) -> Option<PathBuf> {
 
 fn which_in_path(binary: &str) -> bool {
     resolve_binary_in_path(binary).is_some()
+}
+
+fn send_desktop_notification(summary: &str, body: &str, urgency: &str) {
+    if env::var("OMARCHY_GEMINI_ROUTER_NO_NOTIFY").as_deref() == Ok("1") {
+        return;
+    }
+    if let Some(bin) = resolve_binary_in_path("omarchy-notification-send") {
+        let _ = Command::new(bin)
+            .args([
+                "--app-name",
+                "Gemini ADC Router",
+                "--urgency",
+                urgency,
+                "--",
+                summary,
+                body,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    } else if let Some(bin) = resolve_binary_in_path("notify-send") {
+        let _ = Command::new(bin)
+            .args([
+                "-a",
+                "Gemini ADC Router",
+                "-u",
+                urgency,
+                "--",
+                summary,
+                body,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+}
+
+fn strip_menu_managed_block(raw: &str) -> String {
+    let mut out = Vec::new();
+    let mut in_block = false;
+    for line in raw.lines() {
+        if line.trim() == MENU_BLOCK_BEGIN.trim() {
+            in_block = true;
+            continue;
+        }
+        if in_block {
+            if line.trim() == MENU_BLOCK_END.trim() {
+                in_block = false;
+            }
+            continue;
+        }
+        out.push(line);
+    }
+    let mut joined = out.join("\n");
+    if raw.ends_with('\n') && !joined.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
+}
+
+fn is_menu_enabled() -> Result<bool, String> {
+    let paths = get_paths();
+    let Some(raw) = read_file_safely(&paths.menu_config)? else {
+        return Ok(false);
+    };
+    Ok(raw.contains(MENU_BLOCK_BEGIN) && raw.contains(r#""trigger.gemini-router""#))
+}
+
+fn has_jsonc_entries_after_brace(raw: &str, open_brace_idx: usize) -> bool {
+    let rest = &raw[open_brace_idx + 1..];
+    for line in rest.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        if trimmed.starts_with('}') {
+            return false;
+        }
+        return true;
+    }
+    false
+}
+
+fn configure_menu_entry(enable: bool) -> Result<bool, String> {
+    let paths = get_paths();
+    let raw = read_file_safely(&paths.menu_config)?.unwrap_or_else(|| "{\n}\n".to_string());
+    let cleaned = strip_menu_managed_block(&raw);
+    if !enable {
+        if raw != cleaned || paths.menu_config.is_file() {
+            write_file_safely(&paths.menu_config, &cleaned, 0o600)?;
+        }
+        return Ok(false);
+    }
+
+    let open_brace_idx = cleaned
+        .find('{')
+        .ok_or_else(|| "Invalid omarchy-menu.jsonc: missing opening '{'".to_string())?;
+    let has_following = has_jsonc_entries_after_brace(&cleaned, open_brace_idx);
+    let trailing_comma = if has_following { "," } else { "" };
+
+    let entries = [
+        MENU_BLOCK_BEGIN.to_string(),
+        r#"  "trigger.gemini-router": {"icon": "󰚩", "label": "Gemini ADC Router", "description": "Route Claude Code & OpenAI Codex to Vertex AI Gemini", "aliases": ["gemini", "router", "adc", "vertex"]},"#.to_string(),
+        r#"  "trigger.gemini-router.toggle-both": {"icon": "󰚩", "label": "Toggle Both (Claude + Codex)", "aliases": ["gemini-toggle"], "action": "omarchy-gemini-router-ctl toggle --target both --notify"},"#.to_string(),
+        r#"  "trigger.gemini-router.toggle-claude": {"icon": "󰚩", "label": "Toggle Claude Code Routing", "action": "omarchy-gemini-router-ctl toggle --target claude --notify"},"#.to_string(),
+        r#"  "trigger.gemini-router.toggle-codex": {"icon": "󰚩", "label": "Toggle OpenAI Codex Routing", "action": "omarchy-gemini-router-ctl toggle --target codex --notify"},"#.to_string(),
+        r#"  "trigger.gemini-router.flip-model": {"icon": "󰁯", "label": "Switch Active Gemini Model", "aliases": ["gemini-model"], "action": "omarchy-gemini-router-ctl set-model --flip --notify"},"#.to_string(),
+        format!(
+            r#"  "trigger.gemini-router.adc-login": {{"icon": "󰌋", "label": "Reset Vertex AI ADC Credentials", "action": "omarchy-gemini-router-ctl adc-login --notify"}}{}"#,
+            trailing_comma
+        ),
+        MENU_BLOCK_END.to_string(),
+    ]
+    .join("\n");
+
+    let mut updated = String::with_capacity(cleaned.len() + entries.len() + 4);
+    updated.push_str(&cleaned[..=open_brace_idx]);
+    updated.push('\n');
+    updated.push_str(&entries);
+    if !cleaned[open_brace_idx + 1..].starts_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(&cleaned[open_brace_idx + 1..]);
+    write_file_safely(&paths.menu_config, &updated, 0o600)?;
+    Ok(true)
+}
+
+fn cmd_menu(action: &str) -> Result<Map<String, Value>, String> {
+    let enabled = match action {
+        "enable" => configure_menu_entry(true)?,
+        "disable" => configure_menu_entry(false)?,
+        "toggle" => {
+            let cur = is_menu_enabled()?;
+            configure_menu_entry(!cur)?
+        }
+        "status" => is_menu_enabled()?,
+        other => {
+            return Err(format!(
+                "Invalid menu action '{}'. Use --enable, --disable, --toggle, or --status",
+                other
+            ))
+        }
+    };
+    let mut res = build_status_dict()?;
+    res.insert("menu_enabled".to_string(), Value::Bool(enabled));
+    Ok(res)
 }
 
 fn build_status_dict() -> Result<Map<String, Value>, String> {
@@ -1348,6 +1529,7 @@ fn build_status_dict() -> Result<Map<String, Value>, String> {
         .filter(|s| !s.is_empty())
         .map(|s| Value::String(s.to_string()))
         .unwrap_or(Value::Null);
+    let menu_enabled = is_menu_enabled().unwrap_or(false);
 
     let val = json!({
         "ok": true,
@@ -1361,6 +1543,7 @@ fn build_status_dict() -> Result<Map<String, Value>, String> {
         "both_enabled": claude_on && codex_on,
         "claude_installed": which_in_path("claude"),
         "codex_installed": which_in_path("codex"),
+        "menu_enabled": menu_enabled,
         "primary_model": primary_model,
         "primary_model_display": display_model,
         "primary_model_short": short_model,
@@ -1492,6 +1675,7 @@ fn cmd_toggle(target: &str) -> Result<Map<String, Value>, String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_set_model(
     model_arg: Option<&str>,
     effort_arg: Option<&str>,
@@ -1668,18 +1852,19 @@ fn cmd_logs(lines: usize) -> Result<Map<String, Value>, String> {
         Duration::from_secs(5),
     );
 
-    let entries: Vec<String> = if rc == 0 && !out.trim().is_empty() && !out.contains("-- No entries --") {
-        let all: Vec<String> = out.trim().lines().map(|s| s.to_string()).collect();
-        let start = all.len().saturating_sub(clamped);
-        all[start..].to_vec()
-    } else if log_file.is_file() {
-        let raw = read_file_safely(&log_file)?.unwrap_or_default();
-        let all: Vec<String> = raw.trim().lines().map(|s| s.to_string()).collect();
-        let start = all.len().saturating_sub(clamped);
-        all[start..].to_vec()
-    } else {
-        Vec::new()
-    };
+    let entries: Vec<String> =
+        if rc == 0 && !out.trim().is_empty() && !out.contains("-- No entries --") {
+            let all: Vec<String> = out.trim().lines().map(|s| s.to_string()).collect();
+            let start = all.len().saturating_sub(clamped);
+            all[start..].to_vec()
+        } else if log_file.is_file() {
+            let raw = read_file_safely(&log_file)?.unwrap_or_default();
+            let all: Vec<String> = raw.trim().lines().map(|s| s.to_string()).collect();
+            let start = all.len().saturating_sub(clamped);
+            all[start..].to_vec()
+        } else {
+            Vec::new()
+        };
 
     let text = if entries.is_empty() {
         "No router log entries yet.".to_string()
@@ -1714,11 +1899,15 @@ fn cmd_adc_login() -> Result<Map<String, Value>, String> {
         return Ok(val.as_object().unwrap().clone());
     };
     let gcloud_bin = gcloud_path.to_string_lossy().to_string();
-    let refresh_url = format!("{}/config", router_url());
+    let self_bin = env::current_exe()
+        .ok()
+        .or_else(|| resolve_binary_in_path("omarchy-gemini-router-ctl"))
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "omarchy-gemini-router-ctl".to_string());
     let login_script = format!(
-        "'{}' auth application-default login; curl -s -X POST '{}' -H 'Content-Type: application/json' -d '{{\"refresh_auth\":true}}' >/dev/null 2>&1 || true",
+        "'{}' auth application-default login; '{}' refresh-auth >/dev/null 2>&1 || true",
         gcloud_bin.replace('\'', "'\\''"),
-        refresh_url
+        self_bin.replace('\'', "'\\''")
     );
 
     let candidates: Vec<Vec<String>> = vec![
@@ -1821,10 +2010,27 @@ fn dispatch_cli() -> Result<Map<String, Value>, String> {
     let mut fast_model: Option<String> = None;
     let mut fallback_model: Option<String> = None;
     let mut lines: usize = 40;
+    let mut notify = false;
+    let mut menu_action = "status".to_string();
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--notify" => {
+                notify = true;
+            }
+            "--enable" => {
+                menu_action = "enable".to_string();
+            }
+            "--disable" => {
+                menu_action = "disable".to_string();
+            }
+            "--toggle" => {
+                menu_action = "toggle".to_string();
+            }
+            "--status" => {
+                menu_action = "status".to_string();
+            }
             "--target" => {
                 i += 1;
                 if i < args.len() {
@@ -1914,7 +2120,7 @@ fn dispatch_cli() -> Result<Map<String, Value>, String> {
         i += 1;
     }
 
-    match sub {
+    let res = match sub {
         "status" => build_status_dict(),
         "enable" => cmd_enable(&target, model.as_deref(), effort.as_deref()),
         "disable" => cmd_disable(&target),
@@ -1935,14 +2141,74 @@ fn dispatch_cli() -> Result<Map<String, Value>, String> {
         "logs" => cmd_logs(lines),
         "adc-login" => cmd_adc_login(),
         "refresh-auth" => cmd_refresh_auth(),
+        "menu" => cmd_menu(&menu_action),
         other => Err(format!("Unknown subcommand: '{}'", other)),
+    }?;
+
+    if notify {
+        let status_label = res
+            .get("status_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Updated");
+        let model_display = res
+            .get("primary_model_display")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Gemini");
+        let effort_s = res
+            .get("reasoning_effort")
+            .and_then(|v| v.as_str())
+            .unwrap_or("medium");
+        match sub {
+            "enable" | "disable" | "toggle" => {
+                send_desktop_notification(
+                    status_label,
+                    &format!("Model: {} ({})", model_display, effort_s),
+                    "normal",
+                );
+            }
+            "set-model" => {
+                send_desktop_notification(
+                    &format!("Active Model: {}", model_display),
+                    &format!("{} · Effort: {}", status_label, effort_s),
+                    "normal",
+                );
+            }
+            "adc-login" => {
+                send_desktop_notification(
+                    "Vertex AI ADC Login",
+                    "Launched gcloud application-default login in terminal",
+                    "normal",
+                );
+            }
+            "menu" => {
+                let on = res
+                    .get("menu_enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                send_desktop_notification(
+                    if on {
+                        "Omarchy Menu Enabled"
+                    } else {
+                        "Omarchy Menu Disabled"
+                    },
+                    "SUPER+SPACE -> Trigger -> Gemini ADC Router",
+                    "normal",
+                );
+            }
+            _ => {}
+        }
     }
+
+    Ok(res)
 }
 
 fn main() {
     match dispatch_cli() {
         Ok(res) => {
-            println!("{}", serde_json::to_string(&Value::Object(res)).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string(&Value::Object(res)).unwrap_or_default()
+            );
         }
         Err(err) => {
             println!(
