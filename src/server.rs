@@ -1,10 +1,11 @@
 use crate::adc_auth::ADCAuthManager;
 use crate::translator::{
     anthropic_to_gemini_request, default_fast_gemini_model, default_gemini_model,
-    extract_candidate_parts, extract_usage_counts, format_model_display_name, format_sse,
-    gemini_to_anthropic_response, gemini_to_openai_chat_response, gemini_to_openai_responses,
-    openai_chat_to_gemini_request, openai_responses_to_gemini_request, record_response_cache_state,
-    resolve_gemini_model, AnthropicStreamState, SIGNATURE_STORE,
+    extract_anthropic_cache_hint, extract_candidate_parts, extract_usage_counts,
+    format_model_display_name, format_sse, gemini_to_anthropic_response_with_hint,
+    gemini_to_openai_chat_response, gemini_to_openai_responses, openai_chat_to_gemini_request,
+    openai_responses_to_gemini_request, record_response_cache_state, resolve_gemini_model,
+    AnthropicStreamState, SIGNATURE_STORE,
 };
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -186,7 +187,21 @@ impl RouterMetrics {
             "codex" => g.codex_requests += 1,
             _ => g.chat_requests += 1,
         }
-        g.active_model = vertex_model.to_string();
+        // Only update `active_model` when no explicit primary/default model override is active,
+        // or when the request is not a background fast-tier (haiku/mini/flash) call.
+        if let Some(ref primary_override) = g.default_model_override {
+            let fast = g
+                .fast_model_override
+                .as_deref()
+                .unwrap_or("gemini-3.8-flash");
+            if vertex_model != fast || primary_override == fast {
+                g.active_model = vertex_model.to_string();
+            } else {
+                g.active_model = primary_override.clone();
+            }
+        } else {
+            g.active_model = vertex_model.to_string();
+        }
         g.last_client = Some(client_kind.to_string());
         g.last_requested_model = Some(requested_model.to_string());
         g.last_vertex_model = Some(vertex_model.to_string());
@@ -196,6 +211,24 @@ impl RouterMetrics {
                 .unwrap_or_default()
                 .as_secs(),
         );
+    }
+
+    pub fn record_used_model(&self, used_model: &str) {
+        let mut g = self.inner.lock().unwrap();
+        g.last_vertex_model = Some(used_model.to_string());
+        if let Some(ref primary_override) = g.default_model_override {
+            let fast = g
+                .fast_model_override
+                .as_deref()
+                .unwrap_or("gemini-3.8-flash");
+            if used_model != fast || primary_override == fast {
+                g.active_model = used_model.to_string();
+            } else {
+                g.active_model = primary_override.clone();
+            }
+        } else {
+            g.active_model = used_model.to_string();
+        }
     }
 
     pub fn record_success(&self, tokens_in: u64, tokens_out: u64) {
@@ -410,10 +443,10 @@ impl VertexGeminiUpstream {
             }
         }
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(600))
+            .timeout(Duration::from_secs(3600))
             .connect_timeout(Duration::from_secs(30))
-            .pool_idle_timeout(Duration::from_secs(30))
-            .tcp_keepalive(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(15))
+            .tcp_keepalive(Duration::from_secs(15))
             .build()
             .unwrap_or_default();
         Self {
@@ -459,7 +492,8 @@ impl VertexGeminiUpstream {
         model: &str,
         payload: &Value,
     ) -> std::result::Result<Value, UpstreamError> {
-        for attempt in 0..2 {
+        let mut last_err: Option<UpstreamError> = None;
+        for attempt in 0..4 {
             let url = self
                 .build_endpoint_url(model, false)
                 .map_err(|e| UpstreamError {
@@ -483,16 +517,37 @@ impl VertexGeminiUpstream {
                 req = req.header(&k, &v);
             }
 
-            let resp = req.send().await.map_err(|e| UpstreamError {
-                status_code: 502,
-                message: e.to_string(),
-                details: None,
-            })?;
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let err = UpstreamError {
+                        status_code: 502,
+                        message: e.to_string(),
+                        details: None,
+                    };
+                    if attempt < 3 {
+                        last_err = Some(err);
+                        tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
 
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
             if (status == 401 || status == 403) && attempt == 0 {
                 self.auth.prepare_auth_retry();
+                continue;
+            }
+            if matches!(status, 429 | 500 | 502 | 503 | 504) && attempt < 2 {
+                let details = serde_json::from_str::<Value>(&text).ok();
+                last_err = Some(UpstreamError {
+                    status_code: status,
+                    message: format!("Vertex AI error ({}): {}", status, text),
+                    details,
+                });
+                tokio::time::sleep(Duration::from_millis(400 * (1 << attempt))).await;
                 continue;
             }
             if status >= 400 {
@@ -514,6 +569,9 @@ impl VertexGeminiUpstream {
             });
         }
 
+        if let Some(err) = last_err {
+            return Err(err);
+        }
         self.auth
             .record_auth_failure(401, "Vertex AI authentication failed after token refresh");
         Err(UpstreamError {
@@ -530,7 +588,8 @@ impl VertexGeminiUpstream {
     ) -> std::result::Result<mpsc::Receiver<std::result::Result<Value, UpstreamError>>, UpstreamError>
     {
         let mut resp_opt = None;
-        for attempt in 0..2 {
+        let mut last_err: Option<UpstreamError> = None;
+        for attempt in 0..4 {
             let url = self
                 .build_endpoint_url(model, true)
                 .map_err(|e| UpstreamError {
@@ -554,15 +613,37 @@ impl VertexGeminiUpstream {
                 req = req.header(&k, &v);
             }
 
-            let resp = req.send().await.map_err(|e| UpstreamError {
-                status_code: 502,
-                message: e.to_string(),
-                details: None,
-            })?;
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let err = UpstreamError {
+                        status_code: 502,
+                        message: e.to_string(),
+                        details: None,
+                    };
+                    if attempt < 3 {
+                        last_err = Some(err);
+                        tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
 
             let status = resp.status().as_u16();
             if (status == 401 || status == 403) && attempt == 0 {
                 self.auth.prepare_auth_retry();
+                continue;
+            }
+            if matches!(status, 429 | 500 | 502 | 503 | 504) && attempt < 2 {
+                let text = resp.text().await.unwrap_or_default();
+                let details = serde_json::from_str::<Value>(&text).ok();
+                last_err = Some(UpstreamError {
+                    status_code: status,
+                    message: format!("Vertex AI stream error ({}): {}", status, text),
+                    details,
+                });
+                tokio::time::sleep(Duration::from_millis(400 * (1 << attempt))).await;
                 continue;
             }
             if status >= 400 {
@@ -582,40 +663,74 @@ impl VertexGeminiUpstream {
             break;
         }
 
-        let mut resp = resp_opt.ok_or_else(|| {
-            self.auth.record_auth_failure(
-                401,
-                "Vertex AI stream authentication failed after token refresh",
-            );
-            UpstreamError {
-                status_code: 401,
-                message: "Vertex AI stream authentication failed after token refresh".to_string(),
-                details: None,
+        let mut resp = match resp_opt {
+            Some(r) => r,
+            None => {
+                if let Some(err) = last_err {
+                    return Err(err);
+                }
+                self.auth.record_auth_failure(
+                    401,
+                    "Vertex AI stream authentication failed after token refresh",
+                );
+                return Err(UpstreamError {
+                    status_code: 401,
+                    message: "Vertex AI stream authentication failed after token refresh"
+                        .to_string(),
+                    details: None,
+                });
             }
-        })?;
+        };
 
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(128);
         tokio::spawn(async move {
-            let mut buffer = String::new();
-            while let Ok(Some(chunk)) = resp.chunk().await {
-                let s = String::from_utf8_lossy(&chunk);
-                buffer.push_str(&s);
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].trim().to_string();
-                    buffer.drain(..=pos);
-                    if let Some(data_str) = line.strip_prefix("data:") {
-                        let data_str = data_str.trim();
-                        if !data_str.is_empty() && data_str != "[DONE]" {
-                            if let Ok(parsed) = serde_json::from_str::<Value>(data_str) {
-                                if tx.send(Ok(parsed)).await.is_err() {
-                                    return;
+            let mut raw_buf: Vec<u8> = Vec::with_capacity(8192);
+            loop {
+                match tokio::time::timeout(Duration::from_secs(600), resp.chunk()).await {
+                    Ok(Ok(Some(chunk))) => {
+                        raw_buf.extend_from_slice(&chunk);
+                        while let Some(pos) = raw_buf.iter().position(|&b| b == b'\n') {
+                            let line_bytes: Vec<u8> = raw_buf.drain(..=pos).collect();
+                            let line = String::from_utf8_lossy(&line_bytes);
+                            let line = line.trim();
+                            if let Some(data_str) = line.strip_prefix("data:") {
+                                let data_str = data_str.trim();
+                                if !data_str.is_empty() && data_str != "[DONE]" {
+                                    if let Ok(parsed) = serde_json::from_str::<Value>(data_str) {
+                                        if tx.send(Ok(parsed)).await.is_err() {
+                                            return;
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
+                    Ok(Ok(None)) => break,
+                    Ok(Err(e)) => {
+                        let _ = tx
+                            .send(Err(UpstreamError {
+                                status_code: 502,
+                                message: format!("Vertex AI stream interrupted: {}", e),
+                                details: None,
+                            }))
+                            .await;
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = tx
+                            .send(Err(UpstreamError {
+                                status_code: 504,
+                                message: "Vertex AI stream timed out waiting for next chunk"
+                                    .to_string(),
+                                details: None,
+                            }))
+                            .await;
+                        return;
+                    }
                 }
             }
-            let rem = buffer.trim();
+            let rem_str = String::from_utf8_lossy(&raw_buf);
+            let rem = rem_str.trim();
             if let Some(data_str) = rem.strip_prefix("data:") {
                 let data_str = data_str.trim();
                 if !data_str.is_empty() && data_str != "[DONE]" {
@@ -744,9 +859,7 @@ impl RouterServer {
                 }
             }
         }
-        fallback_model_for(model)
-            .map(|s| s.to_string())
-            .filter(|fb| fb != model)
+        None
     }
 
     pub async fn generate_with_fallback(
@@ -1048,6 +1161,7 @@ impl RouterServer {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 let (gemini_model, gemini_payload) = anthropic_to_gemini_request(&body);
+                let cache_hint = extract_anthropic_cache_hint(&body, &gemini_payload);
                 self.metrics
                     .record_client_request("claude", &requested_model, &gemini_model);
                 let req_started = Instant::now();
@@ -1058,23 +1172,30 @@ impl RouterServer {
                         .await
                     {
                         Ok((used_model, gemini_resp)) => {
-                            let mut g = self.metrics.inner.lock().unwrap();
-                            g.active_model = used_model;
-                            drop(g);
+                            self.metrics.record_used_model(&used_model);
+                            let resp = gemini_to_anthropic_response_with_hint(
+                                &gemini_resp,
+                                &requested_model,
+                                Some(&cache_hint),
+                            );
                             let usage = gemini_resp
                                 .get("usageMetadata")
                                 .cloned()
                                 .unwrap_or_else(|| json!({}));
                             let (tok_in, tok_out, cached_tok, reasoning_tok) =
                                 extract_usage_counts(&usage);
+                            let eff_cached = resp
+                                .get("usage")
+                                .and_then(|u| u.get("cache_read_input_tokens"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(cached_tok);
                             self.metrics.record_usage(
                                 tok_in,
                                 tok_out,
-                                cached_tok,
+                                eff_cached,
                                 reasoning_tok,
                                 Some(req_started.elapsed().as_millis() as u64),
                             );
-                            let resp = gemini_to_anthropic_response(&gemini_resp, &requested_model);
                             RouterResponse::Json(200, resp)
                         }
                         Err(err) => {
@@ -1097,11 +1218,14 @@ impl RouterServer {
                         .await
                     {
                         Ok((used_model, mut chunk_rx)) => {
-                            self.metrics.inner.lock().unwrap().active_model = used_model;
+                            self.metrics.record_used_model(&used_model);
                             let (tx, rx) = mpsc::channel(64);
                             let metrics = self.metrics.clone();
                             tokio::spawn(async move {
-                                let mut state = AnthropicStreamState::new(&requested_model);
+                                let mut state = AnthropicStreamState::with_cache_hint(
+                                    &requested_model,
+                                    Some(cache_hint),
+                                );
                                 while let Some(item) = chunk_rx.recv().await {
                                     match item {
                                         Ok(chunk) => {
@@ -1131,10 +1255,16 @@ impl RouterServer {
                                         return;
                                     }
                                 }
+                                let (_, eff_cached) =
+                                    crate::translator::resolve_effective_anthropic_cache_usage(
+                                        state.input_tokens,
+                                        state.cached_tokens,
+                                        state.cache_hint.as_ref(),
+                                    );
                                 metrics.record_usage(
                                     state.input_tokens,
                                     state.output_tokens,
-                                    state.cached_tokens,
+                                    eff_cached,
                                     state.reasoning_tokens,
                                     Some(req_started.elapsed().as_millis() as u64),
                                 );
@@ -1188,7 +1318,7 @@ impl RouterServer {
                         .await
                     {
                         Ok((used_model, gemini_resp)) => {
-                            self.metrics.inner.lock().unwrap().active_model = used_model;
+                            self.metrics.record_used_model(&used_model);
                             let usage = gemini_resp
                                 .get("usageMetadata")
                                 .cloned()
@@ -1226,7 +1356,7 @@ impl RouterServer {
                         .await
                     {
                         Ok((used_model, mut chunk_rx)) => {
-                            self.metrics.inner.lock().unwrap().active_model = used_model;
+                            self.metrics.record_used_model(&used_model);
                             let (tx, rx) = mpsc::channel(64);
                             let metrics = self.metrics.clone();
                             tokio::spawn(async move {
@@ -1458,7 +1588,7 @@ impl RouterServer {
                         .await
                     {
                         Ok((used_model, gemini_resp)) => {
-                            self.metrics.inner.lock().unwrap().active_model = used_model;
+                            self.metrics.record_used_model(&used_model);
                             let usage = gemini_resp
                                 .get("usageMetadata")
                                 .cloned()
@@ -1506,7 +1636,7 @@ impl RouterServer {
                         .await
                     {
                         Ok((used_model, mut chunk_rx)) => {
-                            self.metrics.inner.lock().unwrap().active_model = used_model;
+                            self.metrics.record_used_model(&used_model);
                             let (tx, rx) = mpsc::channel(64);
                             let metrics = self.metrics.clone();
                             let gemini_payload_for_cache = gemini_payload.clone();
@@ -1869,6 +1999,67 @@ pub async fn serve(
     location: Option<String>,
 ) -> Result<()> {
     let server = Arc::new(RouterServer::new(project, location));
+    // Load persisted router state from disk if available and not explicitly overridden by env
+    if std::env::var("ROUTER_DEFAULT_MODEL").is_err()
+        && std::env::var("GEMINI_PRIMARY_MODEL").is_err()
+    {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_default();
+        if !home.is_empty() {
+            let candidates = [
+                std::path::PathBuf::from(&home).join(".config/omarchy/gemini-router/state.json"),
+                std::path::PathBuf::from(&home).join(".config/gemini-router/state.json"),
+            ];
+            for path in candidates {
+                if let Ok(raw) = std::fs::read_to_string(&path) {
+                    if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+                        if let Some(pm) = val
+                            .get("primary_model")
+                            .or_else(|| val.get("model"))
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.trim().is_empty())
+                        {
+                            server.metrics.set_default_model(pm.trim());
+                            server.metrics.set_hot_swap_active(true);
+                        }
+                        if let Some(fm) = val
+                            .get("fast_model")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.trim().is_empty())
+                        {
+                            server.metrics.set_fast_model(Some(fm.trim()));
+                        }
+                        if let Some(fb) = val
+                            .get("fallback_model")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.trim().is_empty())
+                        {
+                            server.metrics.set_fallback_model(Some(fb.trim()));
+                        }
+                        if let Some(re) = val
+                            .get("reasoning_effort")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.trim().is_empty())
+                        {
+                            server.metrics.set_reasoning_effort(re.trim());
+                            server.metrics.set_hot_swap_active(true);
+                        }
+                        if let Some(arr) = val.get("available_models").and_then(|v| v.as_array()) {
+                            let list: Vec<String> = arr
+                                .iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect();
+                            if !list.is_empty() {
+                                server.metrics.set_available_models(list);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
     let addr = format!("{}:{}", host, port);
     let listener = TcpListener::bind(&addr).await?;
     println!(

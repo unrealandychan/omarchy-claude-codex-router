@@ -42,7 +42,9 @@ impl ThoughtSignatureStore {
             if !id.is_empty() {
                 let mut store = self.store.lock().unwrap();
                 let mut order = self.order.lock().unwrap();
-                if !store.contains_key(id) && order.len() >= self.max_entries {
+                if store.contains_key(id) {
+                    order.retain(|k| k != id);
+                } else if order.len() >= self.max_entries {
                     if let Some(oldest) = order.pop_front() {
                         store.remove(&oldest);
                     }
@@ -55,8 +57,12 @@ impl ThoughtSignatureStore {
 
     pub fn get(&self, call_id: Option<&str>) -> Option<String> {
         if let Some(id) = call_id {
-            if let Some(sig) = self.store.lock().unwrap().get(id) {
-                return Some(sig.clone());
+            let found = self.store.lock().unwrap().get(id).cloned();
+            if let Some(sig) = found {
+                let mut order = self.order.lock().unwrap();
+                order.retain(|k| k != id);
+                order.push_back(id.to_string());
+                return Some(sig);
             }
         }
         self.last_signature.lock().unwrap().clone()
@@ -70,7 +76,7 @@ impl ThoughtSignatureStore {
 }
 
 pub static SIGNATURE_STORE: LazyLock<ThoughtSignatureStore> =
-    LazyLock::new(|| ThoughtSignatureStore::new(2048));
+    LazyLock::new(|| ThoughtSignatureStore::new(4096));
 
 pub struct ToolSchemaStore {
     max_entries: usize,
@@ -93,19 +99,25 @@ impl ToolSchemaStore {
         }
         let mut store = self.store.lock().unwrap();
         let mut order = self.order.lock().unwrap();
-        if !store.contains_key(name) && order.len() >= self.max_entries {
+        if store.contains_key(name) {
+            order.retain(|k| k != name);
+        } else if order.len() >= self.max_entries {
             if let Some(oldest) = order.pop_front() {
                 store.remove(&oldest);
             }
         }
-        if !store.contains_key(name) {
-            order.push_back(name.to_string());
-        }
+        order.push_back(name.to_string());
         store.insert(name.to_string(), declaration.clone());
     }
 
     pub fn get(&self, name: &str) -> Option<Value> {
-        self.store.lock().unwrap().get(name).cloned()
+        let found = self.store.lock().unwrap().get(name).cloned();
+        if found.is_some() {
+            let mut order = self.order.lock().unwrap();
+            order.retain(|k| k != name);
+            order.push_back(name.to_string());
+        }
+        found
     }
 
     pub fn clear(&self) {
@@ -115,7 +127,7 @@ impl ToolSchemaStore {
 }
 
 pub static TOOL_SCHEMA_STORE: LazyLock<ToolSchemaStore> =
-    LazyLock::new(|| ToolSchemaStore::new(1024));
+    LazyLock::new(|| ToolSchemaStore::new(2048));
 
 #[derive(Clone, Debug)]
 pub struct CachedResponseState {
@@ -146,19 +158,25 @@ impl ResponseCacheStore {
         }
         let mut store = self.store.lock().unwrap();
         let mut order = self.order.lock().unwrap();
-        if !store.contains_key(key) && order.len() >= self.max_entries {
+        if store.contains_key(key) {
+            order.retain(|k| k != key);
+        } else if order.len() >= self.max_entries {
             if let Some(oldest) = order.pop_front() {
                 store.remove(&oldest);
             }
         }
-        if !store.contains_key(key) {
-            order.push_back(key.to_string());
-        }
+        order.push_back(key.to_string());
         store.insert(key.to_string(), state);
     }
 
     pub fn get(&self, key: &str) -> Option<CachedResponseState> {
-        self.store.lock().unwrap().get(key).cloned()
+        let found = self.store.lock().unwrap().get(key).cloned();
+        if found.is_some() {
+            let mut order = self.order.lock().unwrap();
+            order.retain(|k| k != key);
+            order.push_back(key.to_string());
+        }
+        found
     }
 
     pub fn clear(&self) {
@@ -168,7 +186,187 @@ impl ResponseCacheStore {
 }
 
 pub static RESPONSE_CACHE_STORE: LazyLock<ResponseCacheStore> =
-    LazyLock::new(|| ResponseCacheStore::new(512));
+    LazyLock::new(|| ResponseCacheStore::new(1024));
+
+#[derive(Clone, Debug, Default)]
+pub struct AnthropicCacheHint {
+    pub session_key: String,
+    pub has_cache_control: bool,
+    pub is_multi_turn: bool,
+    pub estimated_prefix_tokens: u64,
+    pub estimated_new_turn_tokens: u64,
+}
+
+pub struct PromptCacheStore {
+    max_entries: usize,
+    order: Mutex<VecDeque<String>>,
+    store: Mutex<HashMap<String, u64>>,
+}
+
+impl PromptCacheStore {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            order: Mutex::new(VecDeque::new()),
+            store: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn record(&self, key: &str, cached_tokens: u64) {
+        if key.is_empty() || cached_tokens == 0 {
+            return;
+        }
+        let mut order = self.order.lock().unwrap();
+        let mut store = self.store.lock().unwrap();
+        order.retain(|k| k != key);
+        if order.len() >= self.max_entries {
+            if let Some(oldest) = order.pop_front() {
+                store.remove(&oldest);
+            }
+        }
+        order.push_back(key.to_string());
+        store.insert(key.to_string(), cached_tokens);
+    }
+
+    pub fn get(&self, key: &str) -> Option<u64> {
+        let found = self.store.lock().unwrap().get(key).copied();
+        if found.is_some() {
+            let mut order = self.order.lock().unwrap();
+            order.retain(|k| k != key);
+            order.push_back(key.to_string());
+        }
+        found
+    }
+
+    pub fn clear(&self) {
+        self.order.lock().unwrap().clear();
+        self.store.lock().unwrap().clear();
+    }
+}
+
+pub static PROMPT_CACHE_STORE: LazyLock<PromptCacheStore> =
+    LazyLock::new(|| PromptCacheStore::new(512));
+
+pub fn extract_anthropic_cache_hint(body: &Value, gemini_payload: &Value) -> AnthropicCacheHint {
+    use std::hash::{Hash, Hasher};
+
+    let raw_body_str = serde_json::to_string(body).unwrap_or_default();
+    let has_cache_control = raw_body_str.contains("\"cache_control\"");
+    let messages_len = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let is_multi_turn = messages_len > 1;
+
+    let sys_str = gemini_payload
+        .get("systemInstruction")
+        .and_then(|v| serde_json::to_string(v).ok())
+        .unwrap_or_default();
+    let tools_str = gemini_payload
+        .get("tools")
+        .and_then(|v| serde_json::to_string(v).ok())
+        .unwrap_or_default();
+    let contents = gemini_payload
+        .get("contents")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let first_turn_str = contents
+        .first()
+        .and_then(|v| serde_json::to_string(v).ok())
+        .unwrap_or_default();
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sys_str.hash(&mut hasher);
+    tools_str.hash(&mut hasher);
+    if sys_str.is_empty() && tools_str.is_empty() {
+        first_turn_str.hash(&mut hasher);
+    }
+    let session_key = format!("claude_cache_{:016x}", hasher.finish());
+
+    let mut prefix_bytes = sys_str.len() + tools_str.len();
+    if contents.len() > 1 {
+        for item in &contents[..contents.len() - 1] {
+            if let Ok(s) = serde_json::to_string(item) {
+                prefix_bytes += s.len();
+            }
+        }
+    }
+    let last_turn_bytes = contents
+        .last()
+        .and_then(|v| serde_json::to_string(v).ok())
+        .map(|s| s.len())
+        .unwrap_or(4);
+
+    let estimated_prefix_tokens = (prefix_bytes as u64) / 4;
+    let estimated_new_turn_tokens = std::cmp::max(1, (last_turn_bytes as u64) / 4);
+
+    AnthropicCacheHint {
+        session_key,
+        has_cache_control,
+        is_multi_turn,
+        estimated_prefix_tokens,
+        estimated_new_turn_tokens,
+    }
+}
+
+pub fn resolve_effective_anthropic_cache_usage(
+    prompt_tokens: u64,
+    reported_cached_tokens: u64,
+    hint: Option<&AnthropicCacheHint>,
+) -> (u64, u64) {
+    let Some(h) = hint else {
+        let effective_cached = if prompt_tokens > 0 {
+            reported_cached_tokens.min(prompt_tokens)
+        } else {
+            reported_cached_tokens
+        };
+        return (
+            prompt_tokens.saturating_sub(effective_cached),
+            effective_cached,
+        );
+    };
+
+    let prev_cached = PROMPT_CACHE_STORE.get(&h.session_key).unwrap_or(0);
+    let should_preserve = prev_cached > 0
+        || reported_cached_tokens > 0
+        || (h.has_cache_control && h.estimated_prefix_tokens > 0)
+        || (h.is_multi_turn && h.estimated_prefix_tokens >= 64);
+
+    if !should_preserve {
+        return (prompt_tokens, 0);
+    }
+
+    if prompt_tokens > 0 {
+        let candidate = if prompt_tokens <= prev_cached {
+            // Conversation was compacted or truncated; scale down to current prompt size
+            reported_cached_tokens
+                .max(h.estimated_prefix_tokens)
+                .min(prompt_tokens.saturating_sub(1))
+        } else {
+            reported_cached_tokens
+                .max(prev_cached)
+                .max(h.estimated_prefix_tokens)
+                .min(prompt_tokens.saturating_sub(1))
+        };
+        if candidate > 0 {
+            PROMPT_CACHE_STORE.record(&h.session_key, candidate);
+        }
+        (prompt_tokens.saturating_sub(candidate), candidate)
+    } else {
+        // First SSE chunk (`message_start`) before Vertex AI reports `promptTokenCount`
+        let candidate = reported_cached_tokens
+            .max(prev_cached)
+            .max(h.estimated_prefix_tokens);
+        let uncached_in = if candidate > 0 {
+            h.estimated_new_turn_tokens.max(1)
+        } else {
+            0
+        };
+        (uncached_in, candidate)
+    }
+}
 
 pub fn extract_usage_counts(usage: &Value) -> (u64, u64, u64, u64) {
     let prompt_tokens = usage
@@ -1466,6 +1664,14 @@ pub fn build_safeguard_results(tool_use_ids: &[String]) -> Value {
 }
 
 pub fn gemini_to_anthropic_response(gemini_resp: &Value, requested_model: &str) -> Value {
+    gemini_to_anthropic_response_with_hint(gemini_resp, requested_model, None)
+}
+
+pub fn gemini_to_anthropic_response_with_hint(
+    gemini_resp: &Value,
+    requested_model: &str,
+    cache_hint: Option<&AnthropicCacheHint>,
+) -> Value {
     let (parts, finish_reason, usage) = extract_candidate_parts(gemini_resp);
     let mut content_blocks: Vec<Value> = Vec::new();
     let mut tool_use_ids: Vec<String> = Vec::new();
@@ -1532,7 +1738,8 @@ pub fn gemini_to_anthropic_response(gemini_resp: &Value, requested_model: &str) 
 
     let (prompt_tokens, output_tokens, cached_tokens, _reasoning_tokens) =
         extract_usage_counts(&usage);
-    let uncached_input_tokens = prompt_tokens.saturating_sub(cached_tokens);
+    let (uncached_input_tokens, effective_cached_tokens) =
+        resolve_effective_anthropic_cache_usage(prompt_tokens, cached_tokens, cache_hint);
 
     json!({
         "id": format!("msg_{}", new_short_id(24)),
@@ -1547,7 +1754,7 @@ pub fn gemini_to_anthropic_response(gemini_resp: &Value, requested_model: &str) 
             "input_tokens": uncached_input_tokens,
             "output_tokens": output_tokens,
             "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": cached_tokens,
+            "cache_read_input_tokens": effective_cached_tokens,
         }
     })
 }
@@ -2333,10 +2540,15 @@ pub struct AnthropicStreamState {
     pub output_tokens: u64,
     pub cached_tokens: u64,
     pub reasoning_tokens: u64,
+    pub cache_hint: Option<AnthropicCacheHint>,
 }
 
 impl AnthropicStreamState {
     pub fn new(requested_model: &str) -> Self {
+        Self::with_cache_hint(requested_model, None)
+    }
+
+    pub fn with_cache_hint(requested_model: &str, cache_hint: Option<AnthropicCacheHint>) -> Self {
         Self {
             requested_model: requested_model.to_string(),
             msg_id: format!("msg_{}", new_short_id(24)),
@@ -2349,6 +2561,7 @@ impl AnthropicStreamState {
             output_tokens: 0,
             cached_tokens: 0,
             reasoning_tokens: 0,
+            cache_hint,
         }
     }
 
@@ -2373,7 +2586,11 @@ impl AnthropicStreamState {
 
         if !self.started {
             self.started = true;
-            let uncached_in = self.input_tokens.saturating_sub(self.cached_tokens);
+            let (uncached_in, effective_cached) = resolve_effective_anthropic_cache_usage(
+                self.input_tokens,
+                self.cached_tokens,
+                self.cache_hint.as_ref(),
+            );
             out.push(format_sse(
                 Some("message_start"),
                 &json!({
@@ -2390,7 +2607,7 @@ impl AnthropicStreamState {
                             "input_tokens": uncached_in,
                             "output_tokens": 0,
                             "cache_creation_input_tokens": 0,
-                            "cache_read_input_tokens": self.cached_tokens,
+                            "cache_read_input_tokens": effective_cached,
                         },
                     }
                 }),
@@ -2550,7 +2767,11 @@ impl AnthropicStreamState {
         } else {
             "end_turn"
         };
-        let uncached_in = self.input_tokens.saturating_sub(self.cached_tokens);
+        let (uncached_in, effective_cached) = resolve_effective_anthropic_cache_usage(
+            self.input_tokens,
+            self.cached_tokens,
+            self.cache_hint.as_ref(),
+        );
         out.push(format_sse(
             Some("message_delta"),
             &json!({
@@ -2564,7 +2785,7 @@ impl AnthropicStreamState {
                     "input_tokens": uncached_in,
                     "output_tokens": self.output_tokens,
                     "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": self.cached_tokens,
+                    "cache_read_input_tokens": effective_cached,
                 },
             }),
         ));

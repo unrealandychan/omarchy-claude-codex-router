@@ -428,6 +428,19 @@ fn load_state() -> Result<Map<String, Value>, String> {
             }
         }
     }
+    if env::var("OMARCHY_GEMINI_ROUTER_MOCK_DAEMON").as_deref() != Ok("1") {
+        default_state.remove("mock_router_running");
+    }
+    if let Some(Value::Object(backup_env)) = default_state.get_mut("claude_backup_env") {
+        for k in [
+            "DISABLE_PROMPT_CACHING",
+            "DISABLE_PROMPT_CACHING_HAIKU",
+            "DISABLE_PROMPT_CACHING_SONNET",
+            "DISABLE_PROMPT_CACHING_OPUS",
+        ] {
+            backup_env.remove(k);
+        }
+    }
     let avail = get_state_available_models(&default_state);
     default_state.insert("available_models".to_string(), json!(avail));
     Ok(default_state)
@@ -703,8 +716,20 @@ fn configure_claude_routing(
         );
 
         settings.insert("env".to_string(), Value::Object(base_env));
+        settings.insert(
+            "model".to_string(),
+            Value::String(primary_model.to_string()),
+        );
     } else {
-        if let Some(Value::Object(backup_env)) = state.get("claude_backup_env").cloned() {
+        if let Some(Value::Object(mut backup_env)) = state.get("claude_backup_env").cloned() {
+            for k in [
+                "DISABLE_PROMPT_CACHING",
+                "DISABLE_PROMPT_CACHING_HAIKU",
+                "DISABLE_PROMPT_CACHING_SONNET",
+                "DISABLE_PROMPT_CACHING_OPUS",
+            ] {
+                backup_env.remove(k);
+            }
             if !backup_env.is_empty() {
                 settings.insert("env".to_string(), Value::Object(backup_env));
             } else {
@@ -1386,8 +1411,8 @@ fn cmd_menu(action: &str) -> Result<Map<String, Value>, String> {
 }
 
 fn build_status_dict() -> Result<Map<String, Value>, String> {
-    let state = load_state()?;
-    let health = fetch_router_health(Duration::from_millis(1500));
+    let mut state = load_state()?;
+    let mut health = fetch_router_health(Duration::from_millis(1500));
     let mut router_running = health
         .as_ref()
         .and_then(|h| h.get("status"))
@@ -1433,6 +1458,26 @@ fn build_status_dict() -> Result<Map<String, Value>, String> {
         .and_then(|v| v.as_str())
         .unwrap_or("medium")
         .to_string();
+
+    if let Some(ref h) = health {
+        let hs = h
+            .get("hot_swap_active")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let pm = h
+            .get("primary_model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let re = h
+            .get("reasoning_effort")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if (!hs || pm != state_primary || re != state_effort) && push_router_config(&state, true) {
+            if let Some(refreshed) = fetch_router_health(Duration::from_millis(800)) {
+                health = Some(refreshed);
+            }
+        }
+    }
 
     let (adc_info, primary_model, reasoning_effort, hot_swap_active, stats_info) =
         if let Some(ref h) = health {
@@ -1480,6 +1525,17 @@ fn build_status_dict() -> Result<Map<String, Value>, String> {
 
     let claude_on = is_claude_routed()?;
     let codex_on = is_codex_routed()?;
+
+    if claude_on {
+        let paths = get_paths();
+        if let Ok(Some(raw_settings)) = read_file_safely(&paths.claude_settings) {
+            if raw_settings.contains("\"DISABLE_PROMPT_CACHING")
+                || !raw_settings.contains(&format!("\"ANTHROPIC_MODEL\": \"{}\"", primary_model))
+            {
+                let _ = configure_claude_routing(true, &primary_model, &mut state);
+            }
+        }
+    }
 
     let short_model = format_model_short_label(&primary_model);
     let short_badge = format_model_short_badge(&primary_model);

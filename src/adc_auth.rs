@@ -368,46 +368,62 @@ impl ADCAuthManager {
                             ("refresh_token", rtok),
                             ("grant_type", "refresh_token"),
                         ];
-                        match self.http_client.post(token_uri).form(&params).send().await {
-                            Ok(resp) => {
-                                let status = resp.status();
-                                if let Ok(body) = resp.json::<Value>().await {
-                                    if status.is_success() {
-                                        if let Some(tok) =
-                                            body.get("access_token").and_then(|v| v.as_str())
-                                        {
-                                            let expires_in = body
-                                                .get("expires_in")
-                                                .and_then(|v| v.as_u64())
-                                                .unwrap_or(3600);
-                                            let margin = std::cmp::min(300, expires_in / 2);
-                                            let refresh_after_epoch = Self::now_epoch_secs()
-                                                .saturating_add(expires_in.saturating_sub(margin));
-                                            let token_str = tok.to_string();
-                                            if rejected_tok.as_deref() != Some(token_str.as_str()) {
-                                                *self.last_rejected_token.lock().unwrap() = None;
-                                                *self.cached_token.lock().unwrap() =
-                                                    Some(CachedToken {
-                                                        access_token: token_str.clone(),
-                                                        refresh_after_epoch,
-                                                        adc_fingerprint: Self::adc_fingerprint(),
-                                                    });
-                                                return Ok(token_str);
+                        for attempt in 1..=3u64 {
+                            match self.http_client.post(token_uri).form(&params).send().await {
+                                Ok(resp) => {
+                                    let status = resp.status();
+                                    if let Ok(body) = resp.json::<Value>().await {
+                                        if status.is_success() {
+                                            if let Some(tok) =
+                                                body.get("access_token").and_then(|v| v.as_str())
+                                            {
+                                                let expires_in = body
+                                                    .get("expires_in")
+                                                    .and_then(|v| v.as_u64())
+                                                    .unwrap_or(3600);
+                                                let margin = std::cmp::min(300, expires_in / 2);
+                                                let refresh_after_epoch = Self::now_epoch_secs()
+                                                    .saturating_add(
+                                                        expires_in.saturating_sub(margin),
+                                                    );
+                                                let token_str = tok.to_string();
+                                                if rejected_tok.as_deref()
+                                                    != Some(token_str.as_str())
+                                                {
+                                                    *self.last_rejected_token.lock().unwrap() =
+                                                        None;
+                                                    *self.last_auth_failure.lock().unwrap() = None;
+                                                    *self.cached_token.lock().unwrap() =
+                                                        Some(CachedToken {
+                                                            access_token: token_str.clone(),
+                                                            refresh_after_epoch,
+                                                            adc_fingerprint: Self::adc_fingerprint(
+                                                            ),
+                                                        });
+                                                    return Ok(token_str);
+                                                }
+                                                oauth_candidate = Some(token_str);
+                                                break;
                                             }
-                                            oauth_candidate = Some(token_str);
+                                        } else {
+                                            let desc = body
+                                                .get("error_description")
+                                                .or_else(|| body.get("error"))
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("OAuth2 refresh failed");
+                                            oauth_err = Some(desc.to_string());
+                                            if !status.is_server_error() && status.as_u16() != 429 {
+                                                break;
+                                            }
                                         }
-                                    } else {
-                                        let desc = body
-                                            .get("error_description")
-                                            .or_else(|| body.get("error"))
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("OAuth2 refresh failed");
-                                        oauth_err = Some(desc.to_string());
                                     }
                                 }
+                                Err(e) => {
+                                    oauth_err = Some(e.to_string());
+                                }
                             }
-                            Err(e) => {
-                                oauth_err = Some(e.to_string());
+                            if attempt < 3 {
+                                tokio::time::sleep(Duration::from_millis(150 * attempt)).await;
                             }
                         }
                     }
@@ -430,6 +446,7 @@ impl ADCAuthManager {
                 let token_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !token_str.is_empty() && rejected_tok.as_deref() != Some(token_str.as_str()) {
                     *self.last_rejected_token.lock().unwrap() = None;
+                    *self.last_auth_failure.lock().unwrap() = None;
                     *self.cached_token.lock().unwrap() = Some(CachedToken {
                         access_token: token_str.clone(),
                         refresh_after_epoch: Self::now_epoch_secs().saturating_add(3000),
@@ -445,11 +462,7 @@ impl ADCAuthManager {
         }
 
         if let Some(candidate) = oauth_candidate {
-            *self.cached_token.lock().unwrap() = Some(CachedToken {
-                access_token: candidate.clone(),
-                refresh_after_epoch: Self::now_epoch_secs().saturating_add(3300),
-                adc_fingerprint: Self::adc_fingerprint(),
-            });
+            // Do not re-cache a previously rejected token for an hour; allow immediate retry next turn.
             return Ok(candidate);
         }
 
