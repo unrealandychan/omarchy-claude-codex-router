@@ -3,8 +3,8 @@ use crate::translator::{
     anthropic_to_gemini_request, default_fast_gemini_model, default_gemini_model,
     extract_candidate_parts, extract_usage_counts, format_model_display_name, format_sse,
     gemini_to_anthropic_response, gemini_to_openai_chat_response, gemini_to_openai_responses,
-    openai_chat_to_gemini_request, openai_responses_to_gemini_request,
-    record_response_cache_state, resolve_gemini_model, AnthropicStreamState, SIGNATURE_STORE,
+    openai_chat_to_gemini_request, openai_responses_to_gemini_request, record_response_cache_state,
+    resolve_gemini_model, AnthropicStreamState, SIGNATURE_STORE,
 };
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -694,15 +694,16 @@ impl RouterServer {
                         Value::String("gemini-3.8-flash".to_string()),
                     );
                 } else {
-                    let is_primary_gemini = matches!(
-                        lower.as_str(),
-                        "gemini-3.8-flash"
-                            | "gemini-4-argon"
-                            | "gemini-3.8"
-                            | "gemini-4.0"
-                            | "gemini-4.0-pro"
-                            | "gemini-3.1-pro-preview"
-                    ) || self.metrics.get_available_models().contains(&lower);
+                    let is_primary_gemini =
+                        matches!(
+                            lower.as_str(),
+                            "gemini-3.8-flash"
+                                | "gemini-4-argon"
+                                | "gemini-3.8"
+                                | "gemini-4.0"
+                                | "gemini-4.0-pro"
+                                | "gemini-3.1-pro-preview"
+                        ) || self.metrics.get_available_models().contains(&lower);
                     if lower.is_empty()
                         || !lower.starts_with("gemini-")
                         || hot_swap

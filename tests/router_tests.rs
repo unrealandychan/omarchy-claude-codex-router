@@ -1243,10 +1243,7 @@ fn test_claude_and_codex_prompt_caching_usage_and_prefix_stability() {
     assert_eq!(gem_inc["systemInstruction"], gem_t1["systemInstruction"]);
     let inc_contents = gem_inc["contents"].as_array().unwrap();
     assert_eq!(inc_contents.len(), 3);
-    assert_eq!(
-        inc_contents[0]["parts"][0]["text"],
-        "Turn 1 user question"
-    );
+    assert_eq!(inc_contents[0]["parts"][0]["text"], "Turn 1 user question");
     assert_eq!(inc_contents[1]["parts"][0]["text"], "Turn 1 answer");
     assert_eq!(inc_contents[2]["parts"][0]["text"], "Incremental turn 2");
 }
@@ -1310,7 +1307,8 @@ async fn test_e2e_gui_claude_and_codex_live_model_and_effort_hot_swap() {
         }
     });
 
-    let tmp_adc = std::env::temp_dir().join(format!("mock_adc_hotswap_{}.json", std::process::id()));
+    let tmp_adc =
+        std::env::temp_dir().join(format!("mock_adc_hotswap_{}.json", std::process::id()));
     std::fs::write(
         &tmp_adc,
         json!({
@@ -1399,7 +1397,9 @@ async fn test_e2e_gui_claude_and_codex_live_model_and_effort_hot_swap() {
         "messages": [{"role": "user", "content": "Generate short title"}]
     }))
     .unwrap();
-    server.handle_request("POST", "/v1/messages", &haiku_req).await;
+    server
+        .handle_request("POST", "/v1/messages", &haiku_req)
+        .await;
     {
         let logs = recorded_requests.lock().unwrap();
         let last_req = logs.last().unwrap();
@@ -1486,5 +1486,3 @@ async fn test_e2e_gui_claude_and_codex_live_model_and_effort_hot_swap() {
     std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
     let _ = std::fs::remove_file(&tmp_adc);
 }
-
-

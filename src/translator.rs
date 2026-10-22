@@ -187,7 +187,12 @@ pub fn extract_usage_counts(usage: &Value) -> (u64, u64, u64, u64) {
         .get("thoughtsTokenCount")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    (prompt_tokens, output_tokens, cached_tokens, reasoning_tokens)
+    (
+        prompt_tokens,
+        output_tokens,
+        cached_tokens,
+        reasoning_tokens,
+    )
 }
 
 pub fn record_response_cache_state(
@@ -2356,7 +2361,10 @@ impl AnthropicStreamState {
         if let Some(ct) = usage.get("candidatesTokenCount").and_then(|v| v.as_u64()) {
             self.output_tokens = ct;
         }
-        if let Some(cached) = usage.get("cachedContentTokenCount").and_then(|v| v.as_u64()) {
+        if let Some(cached) = usage
+            .get("cachedContentTokenCount")
+            .and_then(|v| v.as_u64())
+        {
             self.cached_tokens = cached;
         }
         if let Some(thoughts) = usage.get("thoughtsTokenCount").and_then(|v| v.as_u64()) {
