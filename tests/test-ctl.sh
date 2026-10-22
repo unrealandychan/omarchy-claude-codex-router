@@ -129,6 +129,7 @@ assert_eq "$(json_field "${CLAUDE_FILE_CONTENT}" "data['env']['ANTHROPIC_SMALL_F
 assert_eq "$(json_field "${CLAUDE_FILE_CONTENT}" "data['env']['ANTHROPIC_DEFAULT_HAIKU_MODEL']")" "claude-haiku-4-5" "Claude Haiku tier uses claude-haiku-4-5"
 assert_eq "$(json_field "${CLAUDE_FILE_CONTENT}" "data['env']['ANTHROPIC_DEFAULT_OPUS_MODEL']")" "gemini-3.8-flash" "Claude Opus tier tracks primary_model (gemini-3.8-flash)"
 assert_eq "$(json_field "${CLAUDE_FILE_CONTENT}" "'CLAUDE_CODE_USE_VERTEX' in data['env']")" "False" "Conflicting CLAUDE_CODE_USE_VERTEX removed while routed"
+assert_eq "$(json_field "${CLAUDE_FILE_CONTENT}" "'DISABLE_PROMPT_CACHING' in data['env']")" "False" "Prompt caching enforced (DISABLE_PROMPT_CACHING absent)"
 assert_eq "$(json_field "${CLAUDE_FILE_CONTENT}" "data['theme']")" "custom:omarchy" "Claude theme preserved"
 assert_eq "$(json_field "${CLAUDE_FILE_CONTENT}" "'Stop' in data['hooks']")" "True" "Claude hooks preserved"
 

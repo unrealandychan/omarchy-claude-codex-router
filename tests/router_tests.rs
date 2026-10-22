@@ -4,8 +4,8 @@ use omarchy_claude_codex_router::translator::{
     anthropic_to_gemini_request, format_model_display_name, format_model_short_badge,
     format_model_short_label, gemini_to_anthropic_response, gemini_to_openai_chat_response,
     gemini_to_openai_responses, openai_chat_to_gemini_request, openai_responses_to_gemini_request,
-    resolve_gemini_model, sanitize_json_schema, AnthropicStreamState, SIGNATURE_STORE,
-    SKIP_THOUGHT_SIGNATURE_VALIDATOR,
+    record_response_cache_state, resolve_gemini_model, sanitize_json_schema, AnthropicStreamState,
+    RESPONSE_CACHE_STORE, SIGNATURE_STORE, SKIP_THOUGHT_SIGNATURE_VALIDATOR, TOOL_SCHEMA_STORE,
 };
 use serde_json::{json, Value};
 use std::sync::Mutex;
@@ -1123,3 +1123,368 @@ async fn test_dynamic_models_aliases_and_runtime_config() {
         _ => panic!("Expected 200 JSON from GET /v1/models"),
     }
 }
+
+#[test]
+fn test_claude_and_codex_prompt_caching_usage_and_prefix_stability() {
+    let _guard = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    SIGNATURE_STORE.clear();
+    TOOL_SCHEMA_STORE.clear();
+    RESPONSE_CACHE_STORE.clear();
+
+    // 1. Claude unary + streaming prompt cache token accounting:
+    // Vertex `promptTokenCount` (1000) includes `cachedContentTokenCount` (800).
+    // Anthropic `input_tokens` must be uncached (200) and `cache_read_input_tokens` = 800.
+    let gemini_cached_resp = json!({
+        "candidates": [{
+            "content": {
+                "role": "model",
+                "parts": [{"text": "Cached reply"}]
+            },
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 1000,
+            "candidatesTokenCount": 50,
+            "cachedContentTokenCount": 800,
+            "thoughtsTokenCount": 30
+        }
+    });
+
+    let claude_unary = gemini_to_anthropic_response(&gemini_cached_resp, "gemini-4-argon");
+    assert_eq!(claude_unary["usage"]["input_tokens"], 200);
+    assert_eq!(claude_unary["usage"]["cache_read_input_tokens"], 800);
+    assert_eq!(claude_unary["usage"]["cache_creation_input_tokens"], 0);
+    assert_eq!(claude_unary["usage"]["output_tokens"], 50);
+
+    let mut stream_state = AnthropicStreamState::new("gemini-4-argon");
+    let mut sse_events = stream_state.process_gemini_chunk(&gemini_cached_resp);
+    sse_events.extend(stream_state.finish());
+    let joined_sse = sse_events.join("");
+    assert!(joined_sse.contains("\"cache_read_input_tokens\":800"));
+    assert!(joined_sse.contains("\"input_tokens\":200"));
+    assert_eq!(stream_state.cached_tokens, 800);
+    assert_eq!(stream_state.reasoning_tokens, 30);
+
+    // 2. OpenAI Codex (/v1/responses and /v1/chat/completions) cached & reasoning token details
+    let codex_unary = gemini_to_openai_responses(&gemini_cached_resp, "gemini-4-argon");
+    assert_eq!(codex_unary["usage"]["input_tokens"], 1000);
+    assert_eq!(
+        codex_unary["usage"]["input_tokens_details"]["cached_tokens"],
+        800
+    );
+    assert_eq!(
+        codex_unary["usage"]["input_tokens_details"]["cache_write_tokens"],
+        0
+    );
+    assert_eq!(codex_unary["usage"]["output_tokens"], 50);
+    assert_eq!(
+        codex_unary["usage"]["output_tokens_details"]["reasoning_tokens"],
+        30
+    );
+
+    let chat_unary = gemini_to_openai_chat_response(&gemini_cached_resp, "gemini-4-argon");
+    assert_eq!(
+        chat_unary["usage"]["prompt_tokens_details"]["cached_tokens"],
+        800
+    );
+    assert_eq!(
+        chat_unary["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        30
+    );
+
+    // 3. Codex prefix stability: mid-conversation `developer` messages must NOT mutate root `systemInstruction`
+    let codex_turn1 = json!({
+        "model": "gemini-4-argon",
+        "instructions": "Base system prompt",
+        "input": [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Permissions: workspace-write"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Turn 1 user question"}]}
+        ]
+    });
+    let (_m1, gem_t1) = openai_responses_to_gemini_request(&codex_turn1);
+
+    let codex_turn2 = json!({
+        "model": "gemini-4-argon",
+        "instructions": "Base system prompt",
+        "input": [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Permissions: workspace-write"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Turn 1 user question"}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Turn 1 answer"}]},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Mid-turn environment update"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Turn 2 user question"}]}
+        ]
+    });
+    let (_m2, gem_t2) = openai_responses_to_gemini_request(&codex_turn2);
+
+    // `systemInstruction` must be 100% identical between Turn 1 and Turn 2 so Vertex AI hits the prefix cache!
+    assert_eq!(gem_t1["systemInstruction"], gem_t2["systemInstruction"]);
+    assert_eq!(gem_t1["contents"][0], gem_t2["contents"][0]);
+
+    // 4. `previous_response_id` stateful prefix reconstruction via RESPONSE_CACHE_STORE
+    record_response_cache_state(
+        "resp_turn1_cached",
+        Some("codex_session_key_1"),
+        &gem_t1,
+        &[json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Turn 1 answer"}]
+        })],
+    );
+
+    let codex_incremental_turn2 = json!({
+        "model": "gemini-4-argon",
+        "previous_response_id": "resp_turn1_cached",
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Incremental turn 2"}]}
+        ]
+    });
+    let (_m_inc, gem_inc) = openai_responses_to_gemini_request(&codex_incremental_turn2);
+    assert_eq!(gem_inc["systemInstruction"], gem_t1["systemInstruction"]);
+    let inc_contents = gem_inc["contents"].as_array().unwrap();
+    assert_eq!(inc_contents.len(), 3);
+    assert_eq!(
+        inc_contents[0]["parts"][0]["text"],
+        "Turn 1 user question"
+    );
+    assert_eq!(inc_contents[1]["parts"][0]["text"], "Turn 1 answer");
+    assert_eq!(inc_contents[2]["parts"][0]["text"], "Incremental turn 2");
+}
+
+#[tokio::test]
+async fn test_e2e_gui_claude_and_codex_live_model_and_effort_hot_swap() {
+    use omarchy_claude_codex_router::server::{RouterMetrics, VertexGeminiUpstream};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let _async_guard = ASYNC_ENV_LOCK.lock().await;
+    std::env::remove_var("GEMINI_UPSTREAM_URL");
+
+    let recorded_requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+
+    let rec_clone = recorded_requests.clone();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let rec = rec_clone.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 32768];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]).into_owned();
+                if req_str.starts_with("POST /token ") {
+                    let body = json!({
+                        "access_token": "ya29.hot_swap_token",
+                        "expires_in": 3600,
+                        "token_type": "Bearer"
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                } else {
+                    rec.lock().unwrap().push(req_str);
+                    let ok_body = json!({
+                        "candidates": [{
+                            "content": {
+                                "role": "model",
+                                "parts": [{"text": "Hot-swapped response OK"}]
+                            },
+                            "finishReason": "STOP"
+                        }],
+                        "usageMetadata": {"promptTokenCount": 12, "candidatesTokenCount": 6}
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        ok_body.len(),
+                        ok_body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            });
+        }
+    });
+
+    let tmp_adc = std::env::temp_dir().join(format!("mock_adc_hotswap_{}.json", std::process::id()));
+    std::fs::write(
+        &tmp_adc,
+        json!({
+            "client_id": "test-client",
+            "client_secret": "test-secret",
+            "refresh_token": "test-refresh",
+            "token_uri": format!("http://{}/token", mock_addr),
+            "type": "authorized_user",
+            "quota_project_id": "test-proj"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", &tmp_adc);
+
+    let auth = Arc::new(ADCAuthManager::new(
+        Some("test-proj".to_string()),
+        Some("global".to_string()),
+    ));
+    let mut upstream = VertexGeminiUpstream::new(auth.clone());
+    upstream.base_url_override = Some(format!("http://{}", mock_addr));
+    let server = RouterServer {
+        auth: auth.clone(),
+        upstream: Arc::new(upstream),
+        metrics: Arc::new(RouterMetrics::new()),
+    };
+
+    // Step 1: User selects gemini-4-argon + high effort in Notification Bar UI (POST /config)
+    let cfg_argon = serde_json::to_vec(&json!({
+        "primary_model": "gemini-4-argon",
+        "reasoning_effort": "high",
+        "hot_swap": true
+    }))
+    .unwrap();
+    server.handle_request("POST", "/config", &cfg_argon).await;
+
+    // Verify GET /v1/models lists gemini-4-argon first for GUI model pickers
+    match server.handle_request("GET", "/v1/models", b"").await {
+        RouterResponse::Json(code, data) => {
+            assert_eq!(code, 200);
+            assert_eq!(data["first_id"], "gemini-4-argon");
+            assert_eq!(data["data"][0]["id"], "gemini-4-argon");
+            assert_eq!(data["data"][0]["type"], "model");
+            assert_eq!(data["has_more"], false);
+        }
+        _ => panic!("Expected JSON from GET /v1/models"),
+    }
+
+    // Step 2: Already-open GUI Claude Code session sends "gemini-3.8-flash[1m]" (cached from when window opened)
+    let claude_gui_req = serde_json::to_vec(&json!({
+        "model": "gemini-3.8-flash[1m]",
+        "messages": [{"role": "user", "content": "Hello from GUI Claude Code"}]
+    }))
+    .unwrap();
+    match server
+        .handle_request("POST", "/v1/messages", &claude_gui_req)
+        .await
+    {
+        RouterResponse::Json(code, data) => {
+            assert_eq!(code, 200);
+            assert_eq!(data["model"], "gemini-4-argon");
+        }
+        _ => panic!("Expected 200 JSON from /v1/messages"),
+    }
+
+    // Verify upstream Vertex AI call was routed to gemini-4-argon with HIGH thinkingLevel
+    {
+        let logs = recorded_requests.lock().unwrap();
+        let last_req = logs.last().unwrap();
+        assert!(
+            last_req.contains("/models/gemini-4-argon:generateContent"),
+            "Expected gemini-4-argon in upstream path, got: {}",
+            last_req
+        );
+        assert!(
+            last_req.contains("\"thinkingLevel\":\"HIGH\""),
+            "Expected thinkingLevel HIGH in upstream payload, got: {}",
+            last_req
+        );
+    }
+
+    // Step 3: GUI Claude Code sends a background Haiku request ("claude-haiku-4-5")
+    // Verify it stays on fast tier (gemini-3-flash-preview / gemini-3.8-flash) and is NOT overridden to gemini-4-argon!
+    let haiku_req = serde_json::to_vec(&json!({
+        "model": "claude-haiku-4-5",
+        "messages": [{"role": "user", "content": "Generate short title"}]
+    }))
+    .unwrap();
+    server.handle_request("POST", "/v1/messages", &haiku_req).await;
+    {
+        let logs = recorded_requests.lock().unwrap();
+        let last_req = logs.last().unwrap();
+        assert!(
+            last_req.contains("/models/gemini-3.8-flash:generateContent"),
+            "Expected background Haiku request to use gemini-3.8-flash, got: {}",
+            last_req
+        );
+    }
+
+    // Step 4: Already-open GUI OpenAI Codex session sends "gemini-3.8-flash" with "low" effort to /v1/responses
+    // Verify router hot-swaps it to gemini-4-argon with HIGH thinkingLevel!
+    let codex_gui_req = serde_json::to_vec(&json!({
+        "model": "gemini-3.8-flash",
+        "reasoning": {"effort": "low"},
+        "input": "Refactor module from Codex GUI"
+    }))
+    .unwrap();
+    match server
+        .handle_request("POST", "/v1/responses", &codex_gui_req)
+        .await
+    {
+        RouterResponse::Json(code, data) => {
+            assert_eq!(code, 200);
+            assert_eq!(data["model"], "gemini-4-argon");
+        }
+        _ => panic!("Expected 200 JSON from /v1/responses"),
+    }
+    {
+        let logs = recorded_requests.lock().unwrap();
+        let last_req = logs.last().unwrap();
+        assert!(
+            last_req.contains("/models/gemini-4-argon:generateContent"),
+            "Expected Codex GUI request to hot-swap to gemini-4-argon, got: {}",
+            last_req
+        );
+        assert!(
+            last_req.contains("\"thinkingLevel\":\"HIGH\""),
+            "Expected Codex GUI request to use hot-swapped HIGH thinkingLevel, got: {}",
+            last_req
+        );
+    }
+
+    // Step 5: User flips model back to gemini-3.8-flash and effort to low in Notification Bar UI
+    let cfg_flash = serde_json::to_vec(&json!({
+        "primary_model": "gemini-3.8-flash",
+        "reasoning_effort": "low",
+        "hot_swap": true
+    }))
+    .unwrap();
+    server.handle_request("POST", "/config", &cfg_flash).await;
+
+    // Open GUI Claude Code session (which now sends "gemini-4-argon") is immediately hot-swapped to gemini-3.8-flash + LOW
+    let claude_gui_req2 = serde_json::to_vec(&json!({
+        "model": "gemini-4-argon",
+        "messages": [{"role": "user", "content": "Fast follow-up question"}]
+    }))
+    .unwrap();
+    match server
+        .handle_request("POST", "/v1/messages", &claude_gui_req2)
+        .await
+    {
+        RouterResponse::Json(code, data) => {
+            assert_eq!(code, 200);
+            assert_eq!(data["model"], "gemini-3.8-flash");
+        }
+        _ => panic!("Expected 200 JSON from /v1/messages"),
+    }
+    {
+        let logs = recorded_requests.lock().unwrap();
+        let last_req = logs.last().unwrap();
+        assert!(
+            last_req.contains("/models/gemini-3.8-flash:generateContent"),
+            "Expected hot-swap back to gemini-3.8-flash, got: {}",
+            last_req
+        );
+        assert!(
+            last_req.contains("\"thinkingLevel\":\"LOW\""),
+            "Expected hot-swap to LOW thinkingLevel, got: {}",
+            last_req
+        );
+    }
+
+    std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
+    let _ = std::fs::remove_file(&tmp_adc);
+}
+
+

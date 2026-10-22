@@ -5,7 +5,7 @@
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Language: Rust / QML](https://img.shields.io/badge/Language-Rust%20%2F%20QML-orange.svg)
 ![Platform: Linux / Omarchy](https://img.shields.io/badge/Platform-Linux%20%2F%20Omarchy-blue.svg)
-![Version: 1.0.0](https://img.shields.io/badge/Version-1.0.0-brightgreen.svg)
+![Version: 1.1.0](https://img.shields.io/badge/Version-1.1.0-brightgreen.svg)
 
 ![Gemini ADC Router Preview](preview.png)
 
@@ -414,7 +414,7 @@ cargo test
 
 ```text
 omarchy-claude-codex-router/
-├── manifest.json                      # Omarchy bar-widget plugin manifest (arch.gemini-router v1.0.0)
+├── manifest.json                      # Omarchy bar-widget plugin manifest (arch.gemini-router v1.1.0)
 ├── preview.png                        # Omarchy Marketplace preview screenshot
 ├── install.sh                         # Security-hardened user installer (receipts, backups, atomic writes)
 ├── uninstall.sh                       # Provenance-verified user uninstaller

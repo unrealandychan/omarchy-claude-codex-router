@@ -374,4 +374,4 @@ if command -v omarchy >/dev/null 2>&1; then
   omarchy restart shell 2>/dev/null || true
 fi
 
-echo "==> Installed ${PLUGIN_ID} v1.0.0."
+echo "==> Installed ${PLUGIN_ID} v1.1.0."

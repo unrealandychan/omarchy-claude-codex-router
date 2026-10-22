@@ -32,6 +32,9 @@ const CLAUDE_MANAGED_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
     "DISABLE_PROMPT_CACHING",
+    "DISABLE_PROMPT_CACHING_HAIKU",
+    "DISABLE_PROMPT_CACHING_SONNET",
+    "DISABLE_PROMPT_CACHING_OPUS",
 ];
 
 struct Paths {
@@ -662,6 +665,10 @@ fn configure_claude_routing(
             "ANTHROPIC_API_KEY",
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",
+            "DISABLE_PROMPT_CACHING",
+            "DISABLE_PROMPT_CACHING_HAIKU",
+            "DISABLE_PROMPT_CACHING_SONNET",
+            "DISABLE_PROMPT_CACHING_OPUS",
         ] {
             base_env.remove(conflict_key);
         }
@@ -693,10 +700,6 @@ fn configure_claude_routing(
         base_env.insert(
             "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
             Value::String(primary_model.to_string()),
-        );
-        base_env.insert(
-            "DISABLE_PROMPT_CACHING".to_string(),
-            Value::String("1".to_string()),
         );
 
         settings.insert("env".to_string(), Value::Object(base_env));

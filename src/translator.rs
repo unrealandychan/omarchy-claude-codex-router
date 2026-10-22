@@ -72,6 +72,220 @@ impl ThoughtSignatureStore {
 pub static SIGNATURE_STORE: LazyLock<ThoughtSignatureStore> =
     LazyLock::new(|| ThoughtSignatureStore::new(2048));
 
+pub struct ToolSchemaStore {
+    max_entries: usize,
+    order: Mutex<VecDeque<String>>,
+    store: Mutex<HashMap<String, Value>>,
+}
+
+impl ToolSchemaStore {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            order: Mutex::new(VecDeque::new()),
+            store: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn save(&self, name: &str, declaration: &Value) {
+        if name.is_empty() {
+            return;
+        }
+        let mut store = self.store.lock().unwrap();
+        let mut order = self.order.lock().unwrap();
+        if !store.contains_key(name) && order.len() >= self.max_entries {
+            if let Some(oldest) = order.pop_front() {
+                store.remove(&oldest);
+            }
+        }
+        if !store.contains_key(name) {
+            order.push_back(name.to_string());
+        }
+        store.insert(name.to_string(), declaration.clone());
+    }
+
+    pub fn get(&self, name: &str) -> Option<Value> {
+        self.store.lock().unwrap().get(name).cloned()
+    }
+
+    pub fn clear(&self) {
+        self.order.lock().unwrap().clear();
+        self.store.lock().unwrap().clear();
+    }
+}
+
+pub static TOOL_SCHEMA_STORE: LazyLock<ToolSchemaStore> =
+    LazyLock::new(|| ToolSchemaStore::new(1024));
+
+#[derive(Clone, Debug)]
+pub struct CachedResponseState {
+    pub system_instruction: Option<Value>,
+    pub contents: Vec<Value>,
+    pub tools: Option<Value>,
+    pub call_id_to_name: HashMap<String, String>,
+}
+
+pub struct ResponseCacheStore {
+    max_entries: usize,
+    order: Mutex<VecDeque<String>>,
+    store: Mutex<HashMap<String, CachedResponseState>>,
+}
+
+impl ResponseCacheStore {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            order: Mutex::new(VecDeque::new()),
+            store: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn save(&self, key: &str, state: CachedResponseState) {
+        if key.is_empty() {
+            return;
+        }
+        let mut store = self.store.lock().unwrap();
+        let mut order = self.order.lock().unwrap();
+        if !store.contains_key(key) && order.len() >= self.max_entries {
+            if let Some(oldest) = order.pop_front() {
+                store.remove(&oldest);
+            }
+        }
+        if !store.contains_key(key) {
+            order.push_back(key.to_string());
+        }
+        store.insert(key.to_string(), state);
+    }
+
+    pub fn get(&self, key: &str) -> Option<CachedResponseState> {
+        self.store.lock().unwrap().get(key).cloned()
+    }
+
+    pub fn clear(&self) {
+        self.order.lock().unwrap().clear();
+        self.store.lock().unwrap().clear();
+    }
+}
+
+pub static RESPONSE_CACHE_STORE: LazyLock<ResponseCacheStore> =
+    LazyLock::new(|| ResponseCacheStore::new(512));
+
+pub fn extract_usage_counts(usage: &Value) -> (u64, u64, u64, u64) {
+    let prompt_tokens = usage
+        .get("promptTokenCount")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("candidatesTokenCount")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cached_tokens = usage
+        .get("cachedContentTokenCount")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let reasoning_tokens = usage
+        .get("thoughtsTokenCount")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    (prompt_tokens, output_tokens, cached_tokens, reasoning_tokens)
+}
+
+pub fn record_response_cache_state(
+    response_id: &str,
+    prompt_cache_key: Option<&str>,
+    gemini_payload: &Value,
+    output_or_parts: &[Value],
+) {
+    let sys_inst = gemini_payload.get("systemInstruction").cloned();
+    let tools = gemini_payload.get("tools").cloned();
+    let mut contents = gemini_payload
+        .get("contents")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut converted_parts: Vec<Value> = Vec::new();
+    let mut call_id_to_name: HashMap<String, String> = HashMap::new();
+    for item in output_or_parts {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        if obj.get("thought").and_then(|v| v.as_bool()) == Some(true) {
+            continue;
+        }
+        match obj.get("type").and_then(|t| t.as_str()) {
+            Some("message") => {
+                if let Some(carr) = obj.get("content").and_then(|c| c.as_array()) {
+                    for c in carr {
+                        if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
+                            if !t.is_empty() {
+                                converted_parts.push(json!({"text": t}));
+                            }
+                        }
+                    }
+                } else if let Some(s) = obj.get("content").and_then(|c| c.as_str()) {
+                    if !s.is_empty() {
+                        converted_parts.push(json!({"text": s}));
+                    }
+                }
+            }
+            Some("function_call") => {
+                let name = obj.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                let call_id = obj
+                    .get("call_id")
+                    .or_else(|| obj.get("id"))
+                    .and_then(|v| v.as_str());
+                if let Some(cid) = call_id {
+                    call_id_to_name.insert(cid.to_string(), name.to_string());
+                }
+                let args = match obj.get("arguments") {
+                    Some(Value::String(s)) => {
+                        serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({"raw": s}))
+                    }
+                    Some(Value::Object(m)) => Value::Object(m.clone()),
+                    _ => json!({}),
+                };
+                let sig = obj
+                    .get("thought_signature")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| SIGNATURE_STORE.get(call_id))
+                    .unwrap_or_else(|| SKIP_THOUGHT_SIGNATURE_VALIDATOR.to_string());
+                converted_parts.push(json!({
+                    "functionCall": {
+                        "name": name,
+                        "args": args,
+                    },
+                    "thoughtSignature": sig,
+                }));
+            }
+            _ => {
+                if obj.contains_key("text") || obj.contains_key("functionCall") {
+                    converted_parts.push(item.clone());
+                }
+            }
+        }
+    }
+
+    if !converted_parts.is_empty() {
+        contents.push(json!({
+            "role": "model",
+            "parts": converted_parts,
+        }));
+    }
+
+    let state = CachedResponseState {
+        system_instruction: sys_inst,
+        contents,
+        tools,
+        call_id_to_name,
+    };
+    RESPONSE_CACHE_STORE.save(response_id, state.clone());
+    if let Some(cache_key) = prompt_cache_key.filter(|k| !k.trim().is_empty()) {
+        RESPONSE_CACHE_STORE.save(cache_key.trim(), state);
+    }
+}
+
 pub fn default_gemini_model() -> String {
     std::env::var("GEMINI_DEFAULT_MODEL")
         .ok()
@@ -150,10 +364,18 @@ pub fn resolve_gemini_model(requested_model: Option<&str>) -> String {
     }
 
     // 4. Client tier mappings (Haiku/fast vs Sonnet/Opus/Codex/GPT)
-    if lower.contains("haiku") || lower.contains("mini") || lower.contains("fast") {
+    if lower.contains("haiku")
+        || lower.contains("mini")
+        || lower.contains("fast")
+        || lower.contains("nano")
+    {
         return default_fast_gemini_model();
     }
-    if lower.contains("sonnet") || lower.contains("opus") || lower.contains("claude") {
+    if lower.contains("sonnet")
+        || lower.contains("opus")
+        || lower.contains("fable")
+        || lower.contains("claude")
+    {
         return default_gemini_model();
     }
     if lower.contains("codex")
@@ -235,6 +457,14 @@ pub fn format_model_short_badge(model: &str) -> String {
             };
             format!("G{}{}", first.to_uppercase(), suffix)
         }
+    }
+}
+
+fn effort_to_thinking_level(effort: &str) -> &'static str {
+    match effort.trim().to_lowercase().as_str() {
+        "low" => "LOW",
+        "high" | "xhigh" | "max" => "HIGH",
+        _ => "MEDIUM",
     }
 }
 
@@ -746,14 +976,15 @@ fn ensure_historical_tools_declared(
     contents: &[Value],
     mut fn_declarations: Vec<Value>,
 ) -> Vec<Value> {
-    let mut declared_names: HashSet<String> = fn_declarations
-        .iter()
-        .filter_map(|d| {
-            d.get("name")
-                .and_then(|n| n.as_str())
-                .map(|s| s.to_string())
-        })
-        .collect();
+    let mut declared_names: HashSet<String> = HashSet::new();
+    for d in &fn_declarations {
+        if let Some(name) = d.get("name").and_then(|n| n.as_str()) {
+            if !name.is_empty() {
+                declared_names.insert(name.to_string());
+                TOOL_SCHEMA_STORE.save(name, d);
+            }
+        }
+    }
 
     for msg in contents {
         if let Some(parts) = msg.get("parts").and_then(|p| p.as_array()) {
@@ -763,11 +994,14 @@ fn ensure_historical_tools_declared(
                         if let Some(name) = fc.get("name").and_then(|n| n.as_str()) {
                             if !name.is_empty() && !declared_names.contains(name) {
                                 declared_names.insert(name.to_string());
-                                fn_declarations.push(json!({
-                                    "name": name,
-                                    "description": format!("Tool {}", name),
-                                    "parameters": {"type": "object", "properties": {}},
-                                }));
+                                let decl = TOOL_SCHEMA_STORE.get(name).unwrap_or_else(|| {
+                                    json!({
+                                        "name": name,
+                                        "description": format!("Tool {}", name),
+                                        "parameters": {"type": "object", "properties": {}},
+                                    })
+                                });
+                                fn_declarations.push(decl);
                             }
                         }
                     }
@@ -1110,6 +1344,15 @@ pub fn anthropic_to_gemini_request(body: &Value) -> (String, Value) {
             gen_cfg.insert("stopSequences".to_string(), Value::Array(stop_seqs.clone()));
         }
     }
+    let hot_swap = body
+        .get("_router_hot_swap")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let router_effort = body
+        .get("_router_reasoning_effort")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+
     if let Some(thinking) = body.get("thinking").and_then(|v| v.as_object()) {
         if thinking.get("type").and_then(|t| t.as_str()) == Some("enabled") {
             let budget = thinking
@@ -1125,7 +1368,21 @@ pub fn anthropic_to_gemini_request(body: &Value) -> (String, Value) {
                     }),
                 );
             } else {
-                let level = if budget >= 8192 { "HIGH" } else { "MEDIUM" };
+                let level = if hot_swap {
+                    if let Some(eff) = router_effort {
+                        effort_to_thinking_level(eff)
+                    } else if budget >= 8192 {
+                        "HIGH"
+                    } else {
+                        "MEDIUM"
+                    }
+                } else if budget >= 8192 {
+                    "HIGH"
+                } else if budget <= 1024 {
+                    "LOW"
+                } else {
+                    "MEDIUM"
+                };
                 gen_cfg.insert(
                     "thinkingConfig".to_string(),
                     json!({
@@ -1134,6 +1391,16 @@ pub fn anthropic_to_gemini_request(body: &Value) -> (String, Value) {
                     }),
                 );
             }
+        }
+    } else if hot_swap && !model.starts_with("gemini-2.5") {
+        if let Some(eff) = router_effort {
+            gen_cfg.insert(
+                "thinkingConfig".to_string(),
+                json!({
+                    "includeThoughts": true,
+                    "thinkingLevel": effort_to_thinking_level(eff),
+                }),
+            );
         }
     }
     if !gen_cfg.is_empty() {
@@ -1258,14 +1525,9 @@ pub fn gemini_to_anthropic_response(gemini_resp: &Value, requested_model: &str) 
         }
     };
 
-    let input_tokens = usage
-        .get("promptTokenCount")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let output_tokens = usage
-        .get("candidatesTokenCount")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let (prompt_tokens, output_tokens, cached_tokens, _reasoning_tokens) =
+        extract_usage_counts(&usage);
+    let uncached_input_tokens = prompt_tokens.saturating_sub(cached_tokens);
 
     json!({
         "id": format!("msg_{}", new_short_id(24)),
@@ -1277,10 +1539,10 @@ pub fn gemini_to_anthropic_response(gemini_resp: &Value, requested_model: &str) 
         "stop_sequence": Value::Null,
         "safeguard_results": build_safeguard_results(&tool_use_ids),
         "usage": {
-            "input_tokens": input_tokens,
+            "input_tokens": uncached_input_tokens,
             "output_tokens": output_tokens,
             "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": usage.get("cachedContentTokenCount").and_then(|v| v.as_u64()).unwrap_or(0),
+            "cache_read_input_tokens": cached_tokens,
         }
     })
 }
@@ -1318,17 +1580,32 @@ pub fn openai_chat_to_gemini_request(body: &Value) -> (String, Value) {
         let content = msg.get("content");
 
         if role == "system" || role == "developer" {
+            let mut extracted = Vec::new();
             if let Some(s) = content.and_then(|c| c.as_str()) {
                 if !s.is_empty() {
-                    sys_parts.push(json!({"text": s}));
+                    extracted.push(json!({"text": s}));
                 }
             } else if let Some(arr) = content.and_then(|c| c.as_array()) {
                 for item in arr {
                     if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
                         if !t.is_empty() {
-                            sys_parts.push(json!({"text": t}));
+                            extracted.push(json!({"text": t}));
                         }
                     }
+                }
+            }
+            if !extracted.is_empty() {
+                if raw_contents.is_empty() {
+                    // Leading system/developer messages form the static systemInstruction prefix
+                    sys_parts.extend(extracted);
+                } else {
+                    // Mid-conversation system/developer messages stay in-place as user turns
+                    // so `systemInstruction` at the start of the prompt never mutates and
+                    // invalidates Vertex AI's context cache prefix.
+                    raw_contents.push(json!({
+                        "role": "user",
+                        "parts": extracted,
+                    }));
                 }
             }
             continue;
@@ -1492,13 +1769,31 @@ pub fn openai_chat_to_gemini_request(body: &Value) -> (String, Value) {
             gen_cfg.insert("topP".to_string(), top_p.clone());
         }
     }
-    if let Some(effort) = body.get("reasoning_effort").and_then(|v| v.as_str()) {
+    let hot_swap = body
+        .get("_router_hot_swap")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let router_effort = body
+        .get("_router_reasoning_effort")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let req_effort = body
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            body.get("reasoning")
+                .and_then(|r| r.get("effort"))
+                .and_then(|v| v.as_str())
+        })
+        .filter(|s| !s.trim().is_empty());
+    let effective_effort = if hot_swap {
+        router_effort.or(req_effort)
+    } else {
+        req_effort.or(router_effort)
+    };
+    if let Some(effort) = effective_effort {
         if !model.starts_with("gemini-2.5") {
-            let level = match effort.to_lowercase().as_str() {
-                "low" => "LOW",
-                "high" => "HIGH",
-                _ => "MEDIUM",
-            };
+            let level = effort_to_thinking_level(effort);
             gen_cfg.insert(
                 "thinkingConfig".to_string(),
                 json!({"thinkingLevel": level}),
@@ -1573,14 +1868,8 @@ pub fn gemini_to_openai_chat_response(gemini_resp: &Value, requested_model: &str
         "stop"
     };
 
-    let prompt_tokens = usage
-        .get("promptTokenCount")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let completion_tokens = usage
-        .get("candidatesTokenCount")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let (prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens) =
+        extract_usage_counts(&usage);
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1598,7 +1887,13 @@ pub fn gemini_to_openai_chat_response(gemini_resp: &Value, requested_model: &str
         }],
         "usage": {
             "prompt_tokens": prompt_tokens,
+            "prompt_tokens_details": {
+                "cached_tokens": cached_tokens,
+            },
             "completion_tokens": completion_tokens,
+            "completion_tokens_details": {
+                "reasoning_tokens": reasoning_tokens,
+            },
             "total_tokens": prompt_tokens + completion_tokens,
         }
     })
@@ -1607,6 +1902,18 @@ pub fn gemini_to_openai_chat_response(gemini_resp: &Value, requested_model: &str
 pub fn openai_responses_to_gemini_request(body: &Value) -> (String, Value) {
     let model = resolve_gemini_model(body.get("model").and_then(|v| v.as_str()));
     let mut payload = Map::new();
+
+    let prev_state = body
+        .get("previous_response_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|id| RESPONSE_CACHE_STORE.get(id.trim()))
+        .or_else(|| {
+            body.get("prompt_cache_key")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .and_then(|k| RESPONSE_CACHE_STORE.get(k.trim()))
+        });
 
     if let Some(instructions) = body.get("instructions").and_then(|v| v.as_str()) {
         if !instructions.trim().is_empty() {
@@ -1620,6 +1927,10 @@ pub fn openai_responses_to_gemini_request(body: &Value) -> (String, Value) {
     let input_data = body.get("input");
     let mut raw_contents: Vec<Value> = Vec::new();
     let mut call_id_to_name: HashMap<String, String> = HashMap::new();
+
+    if let Some(ref ps) = prev_state {
+        call_id_to_name.extend(ps.call_id_to_name.clone());
+    }
 
     if let Some(s) = input_data.and_then(|v| v.as_str()) {
         raw_contents.push(json!({
@@ -1714,22 +2025,38 @@ pub fn openai_responses_to_gemini_request(body: &Value) -> (String, Value) {
                 if role == "system" || role == "developer" {
                     let mut sys_texts: Vec<String> = Vec::new();
                     if let Some(s) = obj.get("content").and_then(|c| c.as_str()) {
-                        sys_texts.push(s.to_string());
+                        if !s.is_empty() {
+                            sys_texts.push(s.to_string());
+                        }
                     } else if let Some(carr) = obj.get("content").and_then(|c| c.as_array()) {
                         for c in carr {
                             if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
-                                sys_texts.push(t.to_string());
+                                if !t.is_empty() {
+                                    sys_texts.push(t.to_string());
+                                }
                             }
                         }
                     }
                     if !sys_texts.is_empty() {
-                        let existing = payload
-                            .entry("systemInstruction".to_string())
-                            .or_insert_with(|| json!({"parts": []}));
-                        if let Some(parts_arr) =
-                            existing.get_mut("parts").and_then(|p| p.as_array_mut())
-                        {
-                            parts_arr.push(json!({"text": sys_texts.join("\n")}));
+                        let joined = sys_texts.join("\n");
+                        if raw_contents.is_empty() {
+                            // Leading developer/system items belong in the static systemInstruction prefix
+                            let existing = payload
+                                .entry("systemInstruction".to_string())
+                                .or_insert_with(|| json!({"parts": []}));
+                            if let Some(parts_arr) =
+                                existing.get_mut("parts").and_then(|p| p.as_array_mut())
+                            {
+                                parts_arr.push(json!({"text": joined}));
+                            }
+                        } else {
+                            // Mid-conversation developer/system items stay in-place as user turns
+                            // so `systemInstruction` at the root of the request never mutates and
+                            // invalidates Vertex AI's context cache prefix.
+                            raw_contents.push(json!({
+                                "role": "user",
+                                "parts": [{"text": joined}],
+                            }));
                         }
                     }
                     continue;
@@ -1768,6 +2095,31 @@ pub fn openai_responses_to_gemini_request(body: &Value) -> (String, Value) {
         }
     }
 
+    if let Some(ref ps) = prev_state {
+        if !payload.contains_key("systemInstruction") {
+            if let Some(ref sys) = ps.system_instruction {
+                payload.insert("systemInstruction".to_string(), sys.clone());
+            }
+        }
+        // If `previous_response_id` was explicitly passed and `raw_contents` only contains
+        // incremental delta items (does not already start with the cached first turn),
+        // prepend the cached conversation prefix so Vertex AI hits its prefix cache.
+        if body
+            .get("previous_response_id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+            && !ps.contents.is_empty()
+        {
+            let already_has_prefix = raw_contents.first() == ps.contents.first()
+                && raw_contents.len() > ps.contents.len();
+            if !already_has_prefix {
+                let mut combined = ps.contents.clone();
+                combined.extend(raw_contents);
+                raw_contents = combined;
+            }
+        }
+    }
+
     let normalized_contents = normalize_gemini_contents(raw_contents);
     payload.insert(
         "contents".to_string(),
@@ -1802,6 +2154,17 @@ pub fn openai_responses_to_gemini_request(body: &Value) -> (String, Value) {
                 }
             }
         }
+    } else if let Some(ref ps) = prev_state {
+        if let Some(cached_decls) = ps
+            .tools
+            .as_ref()
+            .and_then(|t| t.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|first| first.get("functionDeclarations"))
+            .and_then(|fd| fd.as_array())
+        {
+            fn_declarations = cached_decls.clone();
+        }
     }
 
     fn_declarations = ensure_historical_tools_declared(&normalized_contents, fn_declarations);
@@ -1819,6 +2182,34 @@ pub fn openai_responses_to_gemini_request(body: &Value) -> (String, Value) {
     if let Some(temp) = body.get("temperature") {
         if !temp.is_null() {
             gen_cfg.insert("temperature".to_string(), temp.clone());
+        }
+    }
+    let hot_swap = body
+        .get("_router_hot_swap")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let router_effort = body
+        .get("_router_reasoning_effort")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let req_effort = body
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .and_then(|v| v.as_str())
+        .or_else(|| body.get("reasoning_effort").and_then(|v| v.as_str()))
+        .filter(|s| !s.trim().is_empty());
+    let effective_effort = if hot_swap {
+        router_effort.or(req_effort)
+    } else {
+        req_effort.or(router_effort)
+    };
+    if let Some(effort) = effective_effort {
+        if !model.starts_with("gemini-2.5") {
+            let level = effort_to_thinking_level(effort);
+            gen_cfg.insert(
+                "thinkingConfig".to_string(),
+                json!({"thinkingLevel": level}),
+            );
         }
     }
     if !gen_cfg.is_empty() {
@@ -1887,14 +2278,8 @@ pub fn gemini_to_openai_responses(gemini_resp: &Value, requested_model: &str) ->
         );
     }
 
-    let input_tokens = usage
-        .get("promptTokenCount")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let output_tokens = usage
-        .get("candidatesTokenCount")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let (input_tokens, output_tokens, cached_tokens, reasoning_tokens) =
+        extract_usage_counts(&usage);
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1909,7 +2294,14 @@ pub fn gemini_to_openai_responses(gemini_resp: &Value, requested_model: &str) ->
         "output": output_items,
         "usage": {
             "input_tokens": input_tokens,
+            "input_tokens_details": {
+                "cached_tokens": cached_tokens,
+                "cache_write_tokens": 0,
+            },
             "output_tokens": output_tokens,
+            "output_tokens_details": {
+                "reasoning_tokens": reasoning_tokens,
+            },
             "total_tokens": input_tokens + output_tokens,
         }
     })
@@ -1934,6 +2326,8 @@ pub struct AnthropicStreamState {
     pub tool_use_ids: Vec<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub reasoning_tokens: u64,
 }
 
 impl AnthropicStreamState {
@@ -1948,13 +2342,30 @@ impl AnthropicStreamState {
             tool_use_ids: Vec::new(),
             input_tokens: 0,
             output_tokens: 0,
+            cached_tokens: 0,
+            reasoning_tokens: 0,
         }
     }
 
     pub fn process_gemini_chunk(&mut self, chunk: &Value) -> Vec<String> {
         let mut out = Vec::new();
+        let (parts, _finish_reason, usage) = extract_candidate_parts(chunk);
+        if let Some(pt) = usage.get("promptTokenCount").and_then(|v| v.as_u64()) {
+            self.input_tokens = pt;
+        }
+        if let Some(ct) = usage.get("candidatesTokenCount").and_then(|v| v.as_u64()) {
+            self.output_tokens = ct;
+        }
+        if let Some(cached) = usage.get("cachedContentTokenCount").and_then(|v| v.as_u64()) {
+            self.cached_tokens = cached;
+        }
+        if let Some(thoughts) = usage.get("thoughtsTokenCount").and_then(|v| v.as_u64()) {
+            self.reasoning_tokens = thoughts;
+        }
+
         if !self.started {
             self.started = true;
+            let uncached_in = self.input_tokens.saturating_sub(self.cached_tokens);
             out.push(format_sse(
                 Some("message_start"),
                 &json!({
@@ -1967,18 +2378,15 @@ impl AnthropicStreamState {
                         "content": [],
                         "stop_reason": Value::Null,
                         "stop_sequence": Value::Null,
-                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                        "usage": {
+                            "input_tokens": uncached_in,
+                            "output_tokens": 0,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": self.cached_tokens,
+                        },
                     }
                 }),
             ));
-        }
-
-        let (parts, _finish_reason, usage) = extract_candidate_parts(chunk);
-        if let Some(pt) = usage.get("promptTokenCount").and_then(|v| v.as_u64()) {
-            self.input_tokens = pt;
-        }
-        if let Some(ct) = usage.get("candidatesTokenCount").and_then(|v| v.as_u64()) {
-            self.output_tokens = ct;
         }
 
         for part in parts {
@@ -2134,6 +2542,7 @@ impl AnthropicStreamState {
         } else {
             "end_turn"
         };
+        let uncached_in = self.input_tokens.saturating_sub(self.cached_tokens);
         out.push(format_sse(
             Some("message_delta"),
             &json!({
@@ -2143,7 +2552,12 @@ impl AnthropicStreamState {
                     "stop_sequence": Value::Null,
                     "safeguard_results": build_safeguard_results(&self.tool_use_ids),
                 },
-                "usage": {"output_tokens": self.output_tokens},
+                "usage": {
+                    "input_tokens": uncached_in,
+                    "output_tokens": self.output_tokens,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": self.cached_tokens,
+                },
             }),
         ));
         out.push(format_sse(

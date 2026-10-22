@@ -1,10 +1,10 @@
 use crate::adc_auth::ADCAuthManager;
 use crate::translator::{
     anthropic_to_gemini_request, default_fast_gemini_model, default_gemini_model,
-    extract_candidate_parts, format_sse, gemini_to_anthropic_response,
-    gemini_to_openai_chat_response, gemini_to_openai_responses, openai_chat_to_gemini_request,
-    openai_responses_to_gemini_request, resolve_gemini_model, AnthropicStreamState,
-    SIGNATURE_STORE,
+    extract_candidate_parts, extract_usage_counts, format_model_display_name, format_sse,
+    gemini_to_anthropic_response, gemini_to_openai_chat_response, gemini_to_openai_responses,
+    openai_chat_to_gemini_request, openai_responses_to_gemini_request,
+    record_response_cache_state, resolve_gemini_model, AnthropicStreamState, SIGNATURE_STORE,
 };
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -199,10 +199,26 @@ impl RouterMetrics {
     }
 
     pub fn record_success(&self, tokens_in: u64, tokens_out: u64) {
+        self.record_usage(tokens_in, tokens_out, 0, 0, None);
+    }
+
+    pub fn record_usage(
+        &self,
+        tokens_in: u64,
+        tokens_out: u64,
+        cached_tokens: u64,
+        reasoning_tokens: u64,
+        latency_ms: Option<u64>,
+    ) {
         let mut g = self.inner.lock().unwrap();
         g.requests_ok += 1;
         g.tokens_in += tokens_in;
         g.tokens_out += tokens_out;
+        g.cached_tokens += cached_tokens;
+        g.reasoning_tokens += reasoning_tokens;
+        if let Some(ms) = latency_ms {
+            g.last_latency_ms = Some(ms);
+        }
     }
 
     pub fn record_error(&self) {
@@ -246,15 +262,33 @@ impl RouterMetrics {
     }
 
     pub fn set_available_models(&self, models: Vec<String>) {
-        let cleaned: Vec<String> = models
-            .into_iter()
-            .map(|m| m.trim().to_string())
-            .filter(|m| !m.is_empty())
-            .map(|m| resolve_gemini_model(Some(&m)))
-            .collect();
-        if !cleaned.is_empty() {
-            self.inner.lock().unwrap().available_models = cleaned;
+        let mut cleaned: Vec<String> = Vec::new();
+        for m in models {
+            let trimmed = m.trim();
+            if !trimmed.is_empty() {
+                let resolved = resolve_gemini_model(Some(trimmed));
+                if !cleaned.contains(&resolved) {
+                    cleaned.push(resolved);
+                }
+            }
         }
+        if !cleaned.is_empty() {
+            let mut g = self.inner.lock().unwrap();
+            let active = g.active_model.clone();
+            if !cleaned.contains(&active) {
+                cleaned.insert(0, active);
+            }
+            g.available_models = cleaned;
+        }
+    }
+
+    pub fn add_available_model(&self, model: &str) -> String {
+        let resolved = resolve_gemini_model(Some(model));
+        let mut g = self.inner.lock().unwrap();
+        if !g.available_models.contains(&resolved) {
+            g.available_models.push(resolved.clone());
+        }
+        resolved
     }
 
     pub fn set_reasoning_effort(&self, effort: &str) {
@@ -301,6 +335,8 @@ impl RouterMetrics {
             "requests_err": g.requests_err,
             "tokens_in": g.tokens_in,
             "tokens_out": g.tokens_out,
+            "cached_tokens": g.cached_tokens,
+            "reasoning_tokens": g.reasoning_tokens,
             "active_model": g.active_model,
             "default_model_override": g.default_model_override,
             "fast_model_override": g.fast_model_override,
@@ -618,14 +654,31 @@ impl RouterServer {
     }
 
     pub fn apply_model_override(&self, mut body: Value) -> Value {
+        let hot_swap = self.metrics.get_hot_swap_active();
+        let effort = self.metrics.get_reasoning_effort();
+        let override_model = self.metrics.get_default_model_override();
+
         if let Some(obj) = body.as_object_mut() {
-            let req_model = obj
+            let raw_model = obj
                 .get("model")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
+                .trim()
                 .to_string();
-            let lower = req_model.to_ascii_lowercase();
-            let is_fast_tier = lower.contains("haiku") || lower.contains("mini");
+            let clean_model = raw_model
+                .split('[')
+                .next()
+                .unwrap_or(&raw_model)
+                .trim()
+                .to_string();
+            let lower = clean_model.to_lowercase();
+            let is_fast_tier = !lower.starts_with("gemini-")
+                && (lower.contains("haiku")
+                    || lower.contains("-mini")
+                    || lower.starts_with("mini")
+                    || lower.contains("nano")
+                    || lower.contains("small")
+                    || lower.contains("fast"));
 
             if is_fast_tier {
                 if let Some(fast_override) = self.metrics.get_fast_model_override() {
@@ -634,14 +687,42 @@ impl RouterServer {
                 }
             }
 
-            if let Some(override_model) = self.metrics.get_default_model_override() {
-                if !is_fast_tier
-                    && (req_model.is_empty()
-                        || !req_model.starts_with("gemini-")
-                        || self.metrics.get_hot_swap_active())
-                {
-                    obj.insert("model".to_string(), Value::String(override_model));
+            if let Some(target_model) = override_model {
+                if is_fast_tier {
+                    obj.insert(
+                        "model".to_string(),
+                        Value::String("gemini-3.8-flash".to_string()),
+                    );
+                } else {
+                    let is_primary_gemini = matches!(
+                        lower.as_str(),
+                        "gemini-3.8-flash"
+                            | "gemini-4-argon"
+                            | "gemini-3.8"
+                            | "gemini-4.0"
+                            | "gemini-4.0-pro"
+                            | "gemini-3.1-pro-preview"
+                    ) || self.metrics.get_available_models().contains(&lower);
+                    if lower.is_empty()
+                        || !lower.starts_with("gemini-")
+                        || hot_swap
+                        || is_primary_gemini
+                    {
+                        obj.insert("model".to_string(), Value::String(target_model));
+                    } else if clean_model != raw_model {
+                        obj.insert("model".to_string(), Value::String(clean_model));
+                    }
                 }
+            } else if clean_model != raw_model && !clean_model.is_empty() {
+                obj.insert("model".to_string(), Value::String(clean_model));
+            }
+
+            if !is_fast_tier && (hot_swap || self.metrics.get_default_model_override().is_some()) {
+                obj.insert(
+                    "_router_reasoning_effort".to_string(),
+                    Value::String(effort),
+                );
+                obj.insert("_router_hot_swap".to_string(), Value::Bool(hot_swap));
             }
         }
         body
@@ -806,6 +887,11 @@ impl RouterServer {
                         .collect();
                     self.metrics.set_available_models(list);
                 }
+                if let Some(add_m) = body.get("add_model").and_then(|v| v.as_str()) {
+                    if !add_m.trim().is_empty() {
+                        self.metrics.add_available_model(add_m.trim());
+                    }
+                }
                 if let Some(m) = body
                     .get("default_model")
                     .or_else(|| body.get("primary_model"))
@@ -883,19 +969,56 @@ impl RouterServer {
                 )
             }
             ("GET", "/models") | ("GET", "/v1/models") => {
-                let models = self.metrics.get_available_models();
+                let active_model = self
+                    .metrics
+                    .get_default_model_override()
+                    .unwrap_or_else(|| self.metrics.get_active_model());
+                let mut models = self.metrics.get_available_models();
+                if !models.contains(&active_model) {
+                    models.insert(0, active_model.clone());
+                } else if let Some(pos) = models.iter().position(|id| *id == active_model) {
+                    if pos > 0 {
+                        let item = models.remove(pos);
+                        models.insert(0, item);
+                    }
+                }
+                let first_id = models
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or("gemini-3.8-flash")
+                    .to_string();
+                let last_id = models
+                    .last()
+                    .map(|s| s.as_str())
+                    .unwrap_or("gemini-2.5-flash-lite")
+                    .to_string();
                 let data: Vec<Value> = models
                     .iter()
                     .map(|m| {
+                        let display_name = format_model_display_name(m);
                         json!({
                             "id": m,
                             "object": "model",
+                            "type": "model",
+                            "display_name": display_name,
                             "created": 1740000000,
+                            "created_at": "2026-01-01T00:00:00Z",
                             "owned_by": "google-vertex-adc",
+                            "context_window": 1048576,
+                            "max_output_tokens": 65536,
                         })
                     })
                     .collect();
-                RouterResponse::Json(200, json!({"object": "list", "data": data}))
+                RouterResponse::Json(
+                    200,
+                    json!({
+                        "object": "list",
+                        "data": data,
+                        "first_id": first_id,
+                        "last_id": last_id,
+                        "has_more": false,
+                    }),
+                )
             }
             ("POST", "/messages/count_tokens") | ("POST", "/v1/messages/count_tokens") => {
                 let body: Value = serde_json::from_slice(body_bytes).unwrap_or_else(|_| json!({}));
@@ -926,6 +1049,7 @@ impl RouterServer {
                 let (gemini_model, gemini_payload) = anthropic_to_gemini_request(&body);
                 self.metrics
                     .record_client_request("claude", &requested_model, &gemini_model);
+                let req_started = Instant::now();
 
                 if !stream {
                     match self
@@ -940,15 +1064,14 @@ impl RouterServer {
                                 .get("usageMetadata")
                                 .cloned()
                                 .unwrap_or_else(|| json!({}));
-                            self.metrics.record_success(
-                                usage
-                                    .get("promptTokenCount")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0),
-                                usage
-                                    .get("candidatesTokenCount")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0),
+                            let (tok_in, tok_out, cached_tok, reasoning_tok) =
+                                extract_usage_counts(&usage);
+                            self.metrics.record_usage(
+                                tok_in,
+                                tok_out,
+                                cached_tok,
+                                reasoning_tok,
+                                Some(req_started.elapsed().as_millis() as u64),
                             );
                             let resp = gemini_to_anthropic_response(&gemini_resp, &requested_model);
                             RouterResponse::Json(200, resp)
@@ -1007,7 +1130,13 @@ impl RouterServer {
                                         return;
                                     }
                                 }
-                                metrics.record_success(state.input_tokens, state.output_tokens);
+                                metrics.record_usage(
+                                    state.input_tokens,
+                                    state.output_tokens,
+                                    state.cached_tokens,
+                                    state.reasoning_tokens,
+                                    Some(req_started.elapsed().as_millis() as u64),
+                                );
                             });
                             RouterResponse::Sse(rx)
                         }
@@ -1050,6 +1179,7 @@ impl RouterServer {
                 let (gemini_model, gemini_payload) = openai_chat_to_gemini_request(&body);
                 self.metrics
                     .record_client_request("chat", &requested_model, &gemini_model);
+                let req_started = Instant::now();
 
                 if !stream {
                     match self
@@ -1062,15 +1192,14 @@ impl RouterServer {
                                 .get("usageMetadata")
                                 .cloned()
                                 .unwrap_or_else(|| json!({}));
-                            self.metrics.record_success(
-                                usage
-                                    .get("promptTokenCount")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0),
-                                usage
-                                    .get("candidatesTokenCount")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0),
+                            let (tok_in, tok_out, cached_tok, reasoning_tok) =
+                                extract_usage_counts(&usage);
+                            self.metrics.record_usage(
+                                tok_in,
+                                tok_out,
+                                cached_tok,
+                                reasoning_tok,
+                                Some(req_started.elapsed().as_millis() as u64),
                             );
                             let resp =
                                 gemini_to_openai_chat_response(&gemini_resp, &requested_model);
@@ -1110,6 +1239,8 @@ impl RouterServer {
                                 let mut tool_idx = 0usize;
                                 let mut tok_in = 0u64;
                                 let mut tok_out = 0u64;
+                                let mut cached_tok = 0u64;
+                                let mut reasoning_tok = 0u64;
 
                                 while let Some(Ok(chunk)) = chunk_rx.recv().await {
                                     let (parts, _finish, usage) = extract_candidate_parts(&chunk);
@@ -1122,6 +1253,17 @@ impl RouterServer {
                                         usage.get("candidatesTokenCount").and_then(|v| v.as_u64())
                                     {
                                         tok_out = ct;
+                                    }
+                                    if let Some(cached) = usage
+                                        .get("cachedContentTokenCount")
+                                        .and_then(|v| v.as_u64())
+                                    {
+                                        cached_tok = cached;
+                                    }
+                                    if let Some(thoughts) =
+                                        usage.get("thoughtsTokenCount").and_then(|v| v.as_u64())
+                                    {
+                                        reasoning_tok = thoughts;
                                     }
                                     if !sent_role {
                                         sent_role = true;
@@ -1238,12 +1380,29 @@ impl RouterServer {
                                                 "index": 0,
                                                 "delta": {},
                                                 "finish_reason": finish_reason,
-                                            }]
+                                            }],
+                                            "usage": {
+                                                "prompt_tokens": tok_in,
+                                                "prompt_tokens_details": {
+                                                    "cached_tokens": cached_tok,
+                                                },
+                                                "completion_tokens": tok_out,
+                                                "completion_tokens_details": {
+                                                    "reasoning_tokens": reasoning_tok,
+                                                },
+                                                "total_tokens": tok_in + tok_out,
+                                            }
                                         }),
                                     ))
                                     .await;
                                 let _ = tx.send("data: [DONE]\n\n".to_string()).await;
-                                metrics.record_success(tok_in, tok_out);
+                                metrics.record_usage(
+                                    tok_in,
+                                    tok_out,
+                                    cached_tok,
+                                    reasoning_tok,
+                                    Some(req_started.elapsed().as_millis() as u64),
+                                );
                             });
                             RouterResponse::Sse(rx)
                         }
@@ -1283,9 +1442,14 @@ impl RouterServer {
                     .get("stream")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let prompt_cache_key = body
+                    .get("prompt_cache_key")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 let (gemini_model, gemini_payload) = openai_responses_to_gemini_request(&body);
                 self.metrics
                     .record_client_request("codex", &requested_model, &gemini_model);
+                let req_started = Instant::now();
 
                 if !stream {
                     match self
@@ -1298,17 +1462,27 @@ impl RouterServer {
                                 .get("usageMetadata")
                                 .cloned()
                                 .unwrap_or_else(|| json!({}));
-                            self.metrics.record_success(
-                                usage
-                                    .get("promptTokenCount")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0),
-                                usage
-                                    .get("candidatesTokenCount")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0),
+                            let (tok_in, tok_out, cached_tok, reasoning_tok) =
+                                extract_usage_counts(&usage);
+                            self.metrics.record_usage(
+                                tok_in,
+                                tok_out,
+                                cached_tok,
+                                reasoning_tok,
+                                Some(req_started.elapsed().as_millis() as u64),
                             );
                             let resp = gemini_to_openai_responses(&gemini_resp, &requested_model);
+                            if let (Some(resp_id), Some(output_arr)) = (
+                                resp.get("id").and_then(|v| v.as_str()),
+                                resp.get("output").and_then(|v| v.as_array()),
+                            ) {
+                                record_response_cache_state(
+                                    resp_id,
+                                    prompt_cache_key.as_deref(),
+                                    &gemini_payload,
+                                    output_arr,
+                                );
+                            }
                             RouterResponse::Json(200, resp)
                         }
                         Err(err) => {
@@ -1334,6 +1508,7 @@ impl RouterServer {
                             self.metrics.inner.lock().unwrap().active_model = used_model;
                             let (tx, rx) = mpsc::channel(64);
                             let metrics = self.metrics.clone();
+                            let gemini_payload_for_cache = gemini_payload.clone();
                             tokio::spawn(async move {
                                 let resp_id = format!("resp_{}", short_id(24));
                                 let msg_id = format!("msg_{}", short_id(24));
@@ -1345,6 +1520,8 @@ impl RouterServer {
                                 let mut output_items: Vec<Value> = Vec::new();
                                 let mut tok_in = 0u64;
                                 let mut tok_out = 0u64;
+                                let mut cached_tok = 0u64;
+                                let mut reasoning_tok = 0u64;
 
                                 let _ = tx
                                     .send(format_sse(
@@ -1374,6 +1551,17 @@ impl RouterServer {
                                         usage.get("candidatesTokenCount").and_then(|v| v.as_u64())
                                     {
                                         tok_out = ct;
+                                    }
+                                    if let Some(cached) = usage
+                                        .get("cachedContentTokenCount")
+                                        .and_then(|v| v.as_u64())
+                                    {
+                                        cached_tok = cached;
+                                    }
+                                    if let Some(thoughts) =
+                                        usage.get("thoughtsTokenCount").and_then(|v| v.as_u64())
+                                    {
+                                        reasoning_tok = thoughts;
                                     }
                                     for part in parts {
                                         let pobj = match part.as_object() {
@@ -1471,6 +1659,13 @@ impl RouterServer {
                                         .await;
                                 }
 
+                                record_response_cache_state(
+                                    &resp_id,
+                                    prompt_cache_key.as_deref(),
+                                    &gemini_payload_for_cache,
+                                    &output_items,
+                                );
+
                                 let _ = tx
                                     .send(format_sse(
                                         Some("response.completed"),
@@ -1485,14 +1680,27 @@ impl RouterServer {
                                                 "output": output_items,
                                                 "usage": {
                                                     "input_tokens": tok_in,
+                                                    "input_tokens_details": {
+                                                        "cached_tokens": cached_tok,
+                                                        "cache_write_tokens": 0,
+                                                    },
                                                     "output_tokens": tok_out,
+                                                    "output_tokens_details": {
+                                                        "reasoning_tokens": reasoning_tok,
+                                                    },
                                                     "total_tokens": tok_in + tok_out,
                                                 }
                                             }
                                         }),
                                     ))
                                     .await;
-                                metrics.record_success(tok_in, tok_out);
+                                metrics.record_usage(
+                                    tok_in,
+                                    tok_out,
+                                    cached_tok,
+                                    reasoning_tok,
+                                    Some(req_started.elapsed().as_millis() as u64),
+                                );
                             });
                             RouterResponse::Sse(rx)
                         }

@@ -56,6 +56,7 @@ BarWidget {
   property int claudeRequests: 0
   property int codexRequests: 0
   property int totalTokens: 0
+  property int cachedTokens: 0
   property int reasoningTokens: 0
   property string lastClient: ""
   property string lastVertexModel: ""
@@ -208,6 +209,7 @@ BarWidget {
         root.claudeRequests = Number(data.stats.claude_requests) || 0
         root.codexRequests = Number(data.stats.codex_requests) || 0
         root.totalTokens = Number(data.stats.total_tokens) || 0
+        root.cachedTokens = Number(data.stats.cached_tokens) || 0
         root.reasoningTokens = Number(data.stats.reasoning_tokens) || 0
         root.lastClient = String(data.stats.last_client || "")
         root.lastVertexModel = String(data.stats.last_vertex_model || "")
@@ -1046,6 +1048,7 @@ BarWidget {
                 text: root.totalRequests > 0
                   ? (root.totalRequests + " reqs (C:" + root.claudeRequests + " X:" + root.codexRequests + ") · "
                     + root.formatCompactNumber(root.totalTokens) + " tok"
+                    + (root.cachedTokens > 0 ? (" (" + root.formatCompactNumber(root.cachedTokens) + " cached)") : "")
                     + (root.lastLatencyMs > 0 ? (" · " + root.lastLatencyMs + "ms") : ""))
                   : "0 requests routed this session"
                 color: root.totalRequests > 0 ? Color.foreground : Color.muted
